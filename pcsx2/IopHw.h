@@ -1,21 +1,11 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
 #pragma once
 
 #include "IopMem.h"
+
+#include "common/StringUtil.h"
 
 static const u32
 	HW_PS1_GPU_START = 0x1F8010A0,
@@ -45,7 +35,7 @@ static const u32
 	HW_SIO_BAUD			= 0x1f80104e,
 
     HW_RAM_SIZE         = 0x1f801060,
-	HW_IREG				= 0x1f801070,
+	HW_ISTAT			= 0x1f801070,
 	HW_IMASK			= 0x1f801074,
 	HW_ICTRL			= 0x1f801078,
 
@@ -74,14 +64,14 @@ static const u32
 
 	// SIO2 is a DMA interface for the SIO.
 
-	HW_SIO2_DATAIN		= 0x1F808260,
-	HW_SIO2_FIFO		= 0x1f808264,
+	HW_SIO2_TX		    = 0x1F808260,
+	HW_SIO2_RX		    = 0x1f808264,
 	HW_SIO2_CTRL		= 0x1f808268,
-	HW_SIO2_RECV1		= 0x1f80826c,
-	HW_SIO2_RECV2		= 0x1f808270,
-	HW_SIO2_RECV3		= 0x1f808274,
-	HW_SIO2_8278        = 0x1F808278, // May as well add defs
-	HW_SIO2_827C        = 0x1F80827C, // for these 2...
+	HW_SIO2_CMD_STAT	= 0x1f80826c,
+	HW_SIO2_PORT_STAT   = 0x1f808270,
+	HW_SIO2_FIFO_STAT	= 0x1f808274,
+	HW_SIO2_FIFO_TX     = 0x1F808278, // May as well add defs
+	HW_SIO2_FIFO_RX     = 0x1F80827C, // for these 2...
 	HW_SIO2_INTR		= 0x1f808280;
 
 enum DMAMadrAddresses
@@ -208,7 +198,7 @@ struct dma_mbc
 	{
 		return (bcr >> 16);
 	}
-	wxString desc() const { return wxsFormat(L"madr: 0x%x bcr: 0x%x chcr: 0x%x", madr, bcr, chcr); }
+	std::string desc() const { return StringUtil::StdStringFromFormat("madr: 0x%x bcr: 0x%x chcr: 0x%x", madr, bcr, chcr); }
 };
 
 struct dma_mbct
@@ -226,7 +216,7 @@ struct dma_mbct
 	{
 		return (bcr >> 16);
 	}
-	wxString desc() const { return wxsFormat(L"madr: 0x%x bcr: 0x%x chcr: 0x%x tadr: 0x%x", madr, bcr, chcr, tadr); }
+	std::string desc() const { return StringUtil::StdStringFromFormat("madr: 0x%x bcr: 0x%x chcr: 0x%x tadr: 0x%x", madr, bcr, chcr, tadr); }
 };
 
 static dma_mbc&		hw_dma0		= (dma_mbc&) iopHw[0x1080];
@@ -277,6 +267,7 @@ static dma_mbc&		hw_dma12	= (dma_mbc&) iopHw[0x1550];
 #define HW_DMA7_MADR (psxHu32(0x1500)) // SPU2 DMA
 #define HW_DMA7_BCR  (psxHu32(0x1504))
 #define HW_DMA7_CHCR (psxHu32(0x1508))
+#define HW_DMA7_TADR (psxHu32(0x150C))
 
 #define HW_DMA8_MADR (psxHu32(0x1510)) // DEV9 DMA
 #define HW_DMA8_BCR  (psxHu32(0x1514))
@@ -317,16 +308,16 @@ enum IopEventId
 	IopEvt_Cdrom,
 	IopEvt_CdromRead,
 	IopEvt_CdvdRead,
+	IopEvt_CdvdSectorReady,
 	IopEvt_DEV9,
 	IopEvt_USB,
 };
 
 extern void PSX_INT( IopEventId n, s32 ecycle);
+extern int psxRemainingCycles(IopEventId n);
 
-extern void psxSetNextBranch( u32 startCycle, s32 delta );
+extern void psxSetNextBranch( u64 startCycle, s32 delta );
 extern void psxSetNextBranchDelta( s32 delta );
-extern int iopTestCycle( u32 startCycle, s32 delta );
-extern void _iopTestInterrupts();
 
 extern void psxHwReset();
 extern u8   psxHw4Read8 (u32 add);

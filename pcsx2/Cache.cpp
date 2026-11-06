@@ -1,539 +1,511 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
-
-#include "PrecompiledHeader.h"
 #include "Common.h"
 #include "Cache.h"
 #include "vtlb.h"
-_cacheS pCache[64];
-
-#define DIRTY_FLAG 0x40
-#define VALID_FLAG 0x20
-#define LRF_FLAG 0x10
-#define LOCK_FLAG 0x8
 
 using namespace R5900;
 using namespace vtlb_private;
 
+namespace
+{
 
-
-int getFreeCache(u32 mem, int mode, int * way ) {
-	int number;
-	int i = (mem >> 6) & 0x3F;
-	u32 vmv=vtlbdata.vmap[mem>>VTLB_PAGE_BITS];
-	s32 ppf=mem+vmv;
-
-	u32 hand=(u8)vmv;
-	u32 paddr=ppf-hand+0x80000000;
-
-	if((cpuRegs.CP0.n.Config & 0x10000)  == 0) CACHE_LOG("Cache off!");
-	
-	if ((pCache[i].tag[0] & ~0xFFF) == (paddr & ~0xFFF) && (pCache[i].tag[0] & VALID_FLAG))
+	union alignas(64) CacheData
 	{
-		*way = 0;
-		if(pCache[i].tag[0] & LOCK_FLAG) CACHE_LOG("Index %x Way %x Locked!!", i, 0);
-		return i;
-	}
-	else if((pCache[i].tag[1] & ~0xFFF) == (paddr & ~0xFFF) && (pCache[i].tag[1] & VALID_FLAG))
+		u8 bytes[64];
+	};
+
+	struct CacheTag
 	{
-		*way = 1;
-		if(pCache[i].tag[1] & LOCK_FLAG) CACHE_LOG("Index %x Way %x Locked!!", i, 1);
-		return i;
+		uptr rawValue;
+		// You are able to configure a TLB entry with non-existant physical address without causing a bus error.
+		// When this happens, the cache still fills with the data and when it gets evicted the data is lost.
+		// We don't emulate memory access on a logic level, so we need to ensure that we don't try to load/store to a non-existant physical address.
+		// This fixes the Find My Own Way demo.
+
+		// The lower parts of a cache tags structure is as follows:
+		// 31 - 12: The physical address cache tag.
+		// 11: Used by PCSX2 to indicate if the physical address is valid.
+		// 10 - 7: Unused.
+		// 6: Dirty flag.
+		// 5: Valid flag.
+		// 4: LRF flag - least recently filled flag.
+		// 3: Lock flag.
+		// 2-0: Unused.
+
+		enum Flags : decltype(rawValue)
+		{
+			DIRTY_FLAG = 0x40,
+			VALID_FLAG = 0x20,
+			LRF_FLAG = 0x10,
+			LOCK_FLAG = 0x8,
+			ALL_FLAGS = 0x7FF,
+			ALL_BITS = 0xFFF
+		};
+
+		int flags() const
+		{
+			return rawValue & ALL_FLAGS;
+		}
+
+		bool isValid() const { return rawValue & VALID_FLAG; }
+		bool isDirty() const { return rawValue & DIRTY_FLAG; }
+		bool lrf() const { return rawValue & LRF_FLAG; }
+		bool isLocked() const { return rawValue & LOCK_FLAG; }
+
+		bool isDirtyAndValid() const
+		{
+			return (rawValue & (DIRTY_FLAG | VALID_FLAG)) == (DIRTY_FLAG | VALID_FLAG);
+		}
+
+		void setValid() { rawValue |= VALID_FLAG; }
+		void setDirty() { rawValue |= DIRTY_FLAG; }
+		void setLocked() { rawValue |= LOCK_FLAG; }
+		void clearValid() { rawValue &= ~VALID_FLAG; }
+		void clearDirty() { rawValue &= ~DIRTY_FLAG; }
+		void clearLocked() { rawValue &= ~LOCK_FLAG; }
+		void toggleLRF() { rawValue ^= LRF_FLAG; }
+
+		uptr addr() const { return rawValue & ~ALL_BITS; }
+
+		void setAddr(uptr addr)
+		{
+			rawValue &= ALL_BITS;
+			rawValue |= (addr & ~ALL_BITS);
+		}
+
+		bool matches(uptr other) const
+		{
+			return isValid() && addr() == (other & ~ALL_BITS);
+		}
+
+		void clear()
+		{
+			rawValue &= LRF_FLAG;
+		}
+
+		constexpr bool isValidPFN() const
+		{
+			return rawValue & 0x800;
+		}
+
+		constexpr void setValidPFN(bool valid)
+		{
+			if (valid)
+				rawValue |= 0x800;
+			else
+				rawValue &= ~0x800;
+		}
+	};
+
+	struct CacheLine
+	{
+		CacheTag& tag;
+		CacheData& data;
+		int set;
+
+		uptr addr()
+		{
+			return tag.addr() | (set << 6);
+		}
+
+		void writeBackIfNeeded()
+		{
+			if (!tag.isDirtyAndValid())
+				return;
+
+			uptr target = addr();
+
+			CACHE_LOG("Write back at %zx", target);
+			if (tag.isValidPFN())
+				*reinterpret_cast<CacheData*>(target) = data;
+			tag.clearDirty();
+		}
+
+		void load(uptr ppf)
+		{
+			pxAssertMsg(!tag.isDirtyAndValid(), "Loaded a value into cache without writing back the old one!");
+
+			tag.setAddr(ppf);
+			if (!tag.isValidPFN())
+			{
+				// Reading from invalid physical addresses seems to return 0 on hardware
+				std::memset(&data, 0, sizeof(data));
+			}
+			else
+			{
+				std::memcpy(&data, reinterpret_cast<void*>(ppf & ~0x3FULL), sizeof(data));
+			}
+
+			tag.setValid();
+			tag.clearDirty();
+		}
+
+		void clear()
+		{
+			tag.clear();
+			std::memset(&data, 0, sizeof(data));
+		}
+	};
+
+	struct CacheSet
+	{
+		CacheTag tags[2];
+		CacheData data[2];
+	};
+
+	struct Cache
+	{
+		CacheSet sets[64];
+
+		int setIdxFor(u32 vaddr) const
+		{
+			return (vaddr >> 6) & 0x3F;
+		}
+
+		CacheLine lineAt(int idx, int way)
+		{
+			return {sets[idx].tags[way], sets[idx].data[way], idx};
+		}
+	};
+
+	static Cache cache = {};
+} // namespace
+
+void resetCache()
+{
+	std::memset(&cache, 0, sizeof(cache));
+}
+
+void writebackCache()
+{
+	for (int i = 0; i < 64; i++)
+	{
+		for (int j = 0; j < 2; j++)
+		{
+			cache.lineAt(i, j).writeBackIfNeeded();
+		}
 	}
+}
 
-	
+static bool findInCache(const CacheSet& set, uptr ppf, int* way)
+{
+	auto check = [&](int checkWay) -> bool {
+		if (!set.tags[checkWay].matches(ppf))
+			return false;
 
-	number = (((pCache[i].tag[0]) & LRF_FLAG) ^ ((pCache[i].tag[1]) & LRF_FLAG)) >> 4;
-	
+		*way = checkWay;
+		return true;
+	};
 
-	ppf = (ppf & ~0x3F) ; 
-	if((pCache[i].tag[number] & (DIRTY_FLAG|VALID_FLAG)) == (DIRTY_FLAG|VALID_FLAG))	// Dirty Write
-	{		
-		s32 oldppf = (pCache[i].tag[number] & ~0x80000fff) + (mem & 0xFC0);
-		
-		CACHE_LOG("Dirty cache fill! PPF %x", oldppf);
-		*reinterpret_cast<mem64_t*>(oldppf) = pCache[i].data[number][0].b8._u64[0];
-		*reinterpret_cast<mem64_t*>(oldppf+8) =  pCache[i].data[number][0].b8._u64[1];
-		*reinterpret_cast<mem64_t*>(oldppf+16) = pCache[i].data[number][1].b8._u64[0];
-		*reinterpret_cast<mem64_t*>(oldppf+24) = pCache[i].data[number][1].b8._u64[1];
-		*reinterpret_cast<mem64_t*>(oldppf+32) = pCache[i].data[number][2].b8._u64[0];
-		*reinterpret_cast<mem64_t*>(oldppf+40) = pCache[i].data[number][2].b8._u64[1];
-		*reinterpret_cast<mem64_t*>(oldppf+48) = pCache[i].data[number][3].b8._u64[0];
-		*reinterpret_cast<mem64_t*>(oldppf+56) = pCache[i].data[number][3].b8._u64[1];
-		pCache[i].tag[number] &= ~DIRTY_FLAG;
+	return check(0) || check(1);
+}
+
+static int getFreeCache(u32 mem, int* way, bool validPFN)
+{
+	const int setIdx = cache.setIdxFor(mem);
+	CacheSet& set = cache.sets[setIdx];
+	VTLBVirtual vmv = vtlbdata.vmap[mem >> VTLB_PAGE_BITS];
+
+	*way = set.tags[0].lrf() ^ set.tags[1].lrf();
+	if (validPFN)
+		pxAssertMsg(!vmv.isHandler(mem), "Cache currently only supports non-handler addresses!");
+
+	uptr ppf = vmv.assumePtr(mem);
+
+	[[unlikely]]
+	if ((cpuRegs.CP0.n.Config & 0x10000) == 0)
+		CACHE_LOG("Cache off!");
+
+	if (findInCache(set, ppf, way))
+	{
+		[[unlikely]]
+		if (set.tags[*way].isLocked())
+		{
+			// Check the other way
+			if (set.tags[*way ^ 1].isLocked())
+			{
+				Console.Error("CACHE: SECOND WAY IS LOCKED.", setIdx, *way);
+			}
+			else
+			{
+				// Force the unlocked way
+				*way ^= 1;
+			}
+		}
 	}
-	
-	
-	pCache[i].data[number][0].b8._u64[0] = *(mem64_t*)(ppf);
-	pCache[i].data[number][0].b8._u64[1] = *(mem64_t*)(ppf+8);
-	pCache[i].data[number][1].b8._u64[0] = *(mem64_t*)(ppf+16);
-	pCache[i].data[number][1].b8._u64[1] = *(mem64_t*)(ppf+24);
-	pCache[i].data[number][2].b8._u64[0] = *(mem64_t*)(ppf+32);
-	pCache[i].data[number][2].b8._u64[1] = *(mem64_t*)(ppf+40);
-	pCache[i].data[number][3].b8._u64[0] = *(mem64_t*)(ppf+48);
-	pCache[i].data[number][3].b8._u64[1] = *(mem64_t*)(ppf+56);
-
-	*way = number;
-	pCache[i].tag[number] |= VALID_FLAG;
-	pCache[i].tag[number] &= 0xFFF;
-	pCache[i].tag[number] |= paddr & ~0xFFF;
-
-	if(pCache[i].tag[number] & LRF_FLAG)
-		pCache[i].tag[number] &= ~LRF_FLAG;
 	else
-		pCache[i].tag[number] |= LRF_FLAG;
-
-	return i;
-	
-}
-
-void writeCache8(u32 mem, u8 value) {
-	int i, number;
-	//u32 vmv=vtlbdata.vmap[mem>>VTLB_PAGE_BITS];
-	//s32 ppf=(mem+vmv) & ~0x3f;
-	i = getFreeCache(mem,1,&number);
-
-	if(i == -1)
 	{
-		u32 vmv=vtlbdata.vmap[mem>>VTLB_PAGE_BITS];
-		s32 ppf=mem+vmv;
-		*reinterpret_cast<mem8_t*>(ppf) = value;
-		return;
-	}
-	CACHE_LOG("writeCache8 %8.8x adding to %d, way %d, value %x", mem, i,number,value);
-	pCache[i].tag[number] |= DIRTY_FLAG;	// Set Dirty Bit if mode == write
-	pCache[i].data[number][(mem>>4) & 0x3].b8._u8[(mem&0xf)] = value;
-}
+		int newWay = set.tags[0].lrf() ^ set.tags[1].lrf();
+		[[unlikely]]
+		if (set.tags[newWay].isLocked())
+		{
+			// If the new way is locked, we force the unlocked way, ignoring the lrf bits.
+			newWay = newWay ^ 1;
+			[[unlikely]]
+			if (set.tags[newWay].isLocked())
+			{
+				Console.Warning("CACHE: SECOND WAY IS LOCKED.", setIdx, *way);
+			}
+		}
+		*way = newWay;
 
-void writeCache16(u32 mem, u16 value) {
-	int i, number;
-	//u32 vmv=vtlbdata.vmap[mem>>VTLB_PAGE_BITS];
-	//s32 ppf=(mem+vmv) & ~0x3f;
-	i = getFreeCache(mem,1,&number);
-	if(i == -1)
-	{
-		u32 vmv=vtlbdata.vmap[mem>>VTLB_PAGE_BITS];
-		s32 ppf=mem+vmv;
-		*reinterpret_cast<mem16_t*>(ppf) = value;
-		return;
-	}
-	CACHE_LOG("writeCache16 %8.8x adding to %d, way %d, value %x", mem, i,number,value);
-	pCache[i].tag[number] |= DIRTY_FLAG;	// Set Dirty Bit if mode == write
-	pCache[i].data[number][(mem>>4) & 0x3].b8._u16[(mem&0xf)>>1] = value;
-}
-
-void writeCache32(u32 mem, u32 value) {
-	int i, number;
-	//u32 vmv=vtlbdata.vmap[mem>>VTLB_PAGE_BITS];
-	//s32 ppf=(mem+vmv) & ~0x3f;
-	i = getFreeCache(mem,1,&number);
-	if(i == -1)
-	{
-		u32 vmv=vtlbdata.vmap[mem>>VTLB_PAGE_BITS];
-		s32 ppf=mem+vmv;
-		*reinterpret_cast<mem32_t*>(ppf) = value;
-		return;
-	}
-	CACHE_LOG("writeCache32 %8.8x adding to %d, way %d, value %x", mem, i,number,value);
-	pCache[i].tag[number] |= DIRTY_FLAG;	// Set Dirty Bit if mode == write
-	pCache[i].data[number][(mem>>4) & 0x3].b8._u32[(mem&0xf)>>2] = value;
-}
-
-void writeCache64(u32 mem, const u64 value) {
-	int i, number;
-	//u32 vmv=vtlbdata.vmap[mem>>VTLB_PAGE_BITS];
-	//s32 ppf=(mem+vmv) & ~0x3f;
-	i = getFreeCache(mem,1,&number);
-	if(i == -1)
-	{
-		u32 vmv=vtlbdata.vmap[mem>>VTLB_PAGE_BITS];
-		s32 ppf=mem+vmv;
-		*reinterpret_cast<mem64_t*>(ppf) = value;
-		return;
-	}
-	CACHE_LOG("writeCache64 %8.8x adding to %d, way %d, value %x", mem, i,number,value);
-	pCache[i].tag[number] |= DIRTY_FLAG;	// Set Dirty Bit if mode == write
-	pCache[i].data[number][(mem>>4) & 0x3].b8._u64[(mem&0xf)>>3] = value;
-}
-
-void writeCache128(u32 mem, const mem128_t* value){
-	int i, number;
-	//u32 vmv=vtlbdata.vmap[mem>>VTLB_PAGE_BITS];
-	//s32 ppf=(mem+vmv) & ~0x3f;
-	i = getFreeCache(mem,1,&number);
-	if(i == -1)
-	{
-		u32 vmv=vtlbdata.vmap[mem>>VTLB_PAGE_BITS];
-		s32 ppf=mem+vmv;
-		*reinterpret_cast<mem64_t*>(ppf) = value->lo;
-		*reinterpret_cast<mem64_t*>(ppf+8) = value->hi;
-		return;
-	}
-	CACHE_LOG("writeCache128 %8.8x adding to %d way %x tag %x vallo = %x_%x valhi = %x_%x", mem, i, number, pCache[i].tag[number], value->lo, value->hi);
-	pCache[i].tag[number] |= DIRTY_FLAG;	// Set Dirty Bit if mode == write
-	pCache[i].data[number][(mem>>4) & 0x3].b8._u64[0] = value->lo;
-	pCache[i].data[number][(mem>>4) & 0x3].b8._u64[1] = value->hi;
-}
-
-u8 readCache8(u32 mem) {
-	int number;
-	
-	int i = getFreeCache(mem,0,&number);
-	if(i == -1)
-	{
-		u32 vmv=vtlbdata.vmap[mem>>VTLB_PAGE_BITS];
-		s32 ppf=mem+vmv;
-		return *(u8*)ppf;
+		CacheLine line = cache.lineAt(setIdx, newWay);
+		line.writeBackIfNeeded();
+		line.tag.setValidPFN(validPFN);
+		line.load(ppf);
+		line.tag.toggleLRF();
 	}
 
-	CACHE_LOG("readCache %8.8x from %d, way %d QW %x u8 part %x Really Reading %x", mem, i, number, (mem >> 4) & 0x3, (mem & 0xf) >> 2, (u32)pCache[i].data[number][(mem >> 4) & 0x3].b8._u8[(mem & 0xf)]);
-	return pCache[i].data[number][(mem >> 4) & 0x3].b8._u8[(mem&0xf)];
+	return setIdx;
 }
 
-u16 readCache16(u32 mem) {
-	int number;
-	
-	int i = getFreeCache(mem,0,&number);
-	if(i == -1)
-	{
-		u32 vmv=vtlbdata.vmap[mem>>VTLB_PAGE_BITS];
-		s32 ppf=mem+vmv;
-		return *(u16*)ppf;
-	}
-
-	CACHE_LOG("readCache %8.8x from %d, way %d QW %x u16 part %x Really Reading %x", mem, i, number, (mem >> 4) & 0x3, (mem & 0xf) >> 2, (u32)pCache[i].data[number][(mem >> 4) & 0x3].b8._u16[(mem & 0xf) >> 1]);
-	return pCache[i].data[number][(mem >> 4) & 0x3].b8._u16[(mem&0xf)>>1];
-}
-
-u32 readCache32(u32 mem) {
-	int number;
-	
-	int i = getFreeCache(mem,0,&number);
-	if(i == -1)
-	{
-		u32 vmv=vtlbdata.vmap[mem>>VTLB_PAGE_BITS];
-		s32 ppf=mem+vmv;
-		return *(u32*)ppf;
-	}
-
-	CACHE_LOG("readCache %8.8x from %d, way %d QW %x u32 part %x Really Reading %x", mem, i, number, (mem >> 4) & 0x3, (mem & 0xf) >> 2, (u32)pCache[i].data[number][(mem >> 4) & 0x3].b8._u32[(mem & 0xf) >> 2]);
-	return pCache[i].data[number][(mem >> 4) & 0x3].b8._u32[(mem&0xf)>>2];
-}
-
-u64 readCache64(u32 mem) {
-	int number;
-	
-	int i = getFreeCache(mem,0,&number);
-	if(i == -1)
-	{
-		u32 vmv=vtlbdata.vmap[mem>>VTLB_PAGE_BITS];
-		s32 ppf=mem+vmv;
-		return *(u64*)ppf;
-	}
-
-	CACHE_LOG("readCache %8.8x from %d, way %d QW %x u64 part %x Really Reading %x_%x", mem, i, number, (mem >> 4) & 0x3, (mem & 0xf) >> 2, pCache[i].data[number][(mem >> 4) & 0x3].b8._u64[(mem & 0xf) >> 3]);
-	return pCache[i].data[number][(mem >> 4) & 0x3].b8._u64[(mem&0xf)>>3];
-}
-
-namespace R5900 {
-namespace Interpreter
+template <bool Write, int Bytes>
+void* prepareCacheAccess(u32 mem, int* way, int* idx, bool validPFN = true)
 {
-namespace OpcodeImpl
-{
-
-extern int Dcache;
-void CACHE() {
-    u32 addr;
-
-   addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
-  // CACHE_LOG("cpuRegs.GPR.r[_Rs_].UL[0] = %x, IMM = %x RT = %x", cpuRegs.GPR.r[_Rs_].UL[0], _Imm_, _Rt_);
-	switch (_Rt_) 
-	{
-		case 0x1a: //DHIN (Data Cache Hit Invalidate)
-		{
-			int index = (addr >> 6) & 0x3F;
-			int way = 0;
-			u32 pfnaddr = addr;
-			u32 vmv=vtlbdata.vmap[pfnaddr>>VTLB_PAGE_BITS];
-			s32 ppf=pfnaddr+vmv;
-			u32 hand=(u8)vmv;
-			u32 paddr=ppf-hand+0x80000000;
-
-			if((paddr & ~0xFFF) == (pCache[index].tag[0] & ~0xfff) && (pCache[index].tag[0] & VALID_FLAG))
-			{
-				way = 0;
-			}
-			else if((paddr & ~0xFFF) == (pCache[index].tag[1] & ~0xfff) && (pCache[index].tag[1] & VALID_FLAG))
-			{
-				way = 1;
-			}
-			else
-			{
-				CACHE_LOG("CACHE DHIN NO HIT addr %x, index %d, phys %x tag0 %x tag1 %x",addr,index, paddr, pCache[index].tag[0], pCache[index].tag[1]);
-				return;
-			}
-
-			CACHE_LOG("CACHE DHIN addr %x, index %d, way %d, Flags %x OP %x",addr,index,way,pCache[index].tag[way] & 0x78, cpuRegs.code);
-
-			pCache[index].tag[way] &= LRF_FLAG;
-			pCache[index].data[way][0].b8._u64[0] = 0;
-			pCache[index].data[way][0].b8._u64[1] = 0;
-			pCache[index].data[way][1].b8._u64[0] = 0;
-			pCache[index].data[way][1].b8._u64[1] = 0;
-			pCache[index].data[way][2].b8._u64[0] = 0;
-			pCache[index].data[way][2].b8._u64[1] = 0;
-			pCache[index].data[way][3].b8._u64[0] = 0;
-			pCache[index].data[way][3].b8._u64[1] = 0;
-
-			break;
-		}
-		case 0x18: //DHWBIN (Data Cache Hit WriteBack with Invalidate)
-		{
-			int index = (addr >> 6) & 0x3F;
-			int way = 0;
-			u32 pfnaddr = addr;
-			u32 vmv=vtlbdata.vmap[pfnaddr>>VTLB_PAGE_BITS];
-			s32 ppf=(pfnaddr+vmv) & ~0x3F;
-			u32 hand=(u8)vmv;
-			u32 paddr=ppf-hand+0x80000000;
-
-			if ((pCache[index].tag[0] & ~0xFFF) == (paddr & ~0xFFF) && (pCache[index].tag[0] & VALID_FLAG))
-			{
-				way = 0;
-			}
-			else if((pCache[index].tag[1] & ~0xFFF) == (paddr & ~0xFFF) && (pCache[index].tag[1] & VALID_FLAG))
-			{
-				way = 1;
-			}
-			else
-			{
-				CACHE_LOG("CACHE DHWBIN NO HIT addr %x, index %d, phys %x tag0 %x tag1 %x",addr,index, paddr, pCache[index].tag[0], pCache[index].tag[1]);
-				return;
-			}
-			
-			
-			CACHE_LOG("CACHE DHWBIN addr %x, index %d, phys %x tag0 %x tag1 %x way %x",addr,index, paddr, pCache[index].tag[0], pCache[index].tag[1], way );
-
-			if((pCache[index].tag[way] & (DIRTY_FLAG|VALID_FLAG)) == (DIRTY_FLAG|VALID_FLAG))	// Dirty
-			{
-				CACHE_LOG("DHWBIN Dirty WriteBack PPF %x", ppf);
-
-				*reinterpret_cast<mem64_t*>(ppf) = pCache[index].data[way][0].b8._u64[0];
-				*reinterpret_cast<mem64_t*>(ppf+8) =  pCache[index].data[way][0].b8._u64[1];
-				*reinterpret_cast<mem64_t*>(ppf+16) = pCache[index].data[way][1].b8._u64[0];
-				*reinterpret_cast<mem64_t*>(ppf+24) = pCache[index].data[way][1].b8._u64[1];
-				*reinterpret_cast<mem64_t*>(ppf+32) = pCache[index].data[way][2].b8._u64[0];
-				*reinterpret_cast<mem64_t*>(ppf+40) = pCache[index].data[way][2].b8._u64[1];
-				*reinterpret_cast<mem64_t*>(ppf+48) = pCache[index].data[way][3].b8._u64[0];
-				*reinterpret_cast<mem64_t*>(ppf+56) = pCache[index].data[way][3].b8._u64[1];
-			}
-
-			pCache[index].tag[way] &= LRF_FLAG;
-
-			pCache[index].data[way][0].b8._u64[0] = 0;
-			pCache[index].data[way][0].b8._u64[1] = 0;
-			pCache[index].data[way][1].b8._u64[0] = 0;
-			pCache[index].data[way][1].b8._u64[1] = 0;
-			pCache[index].data[way][2].b8._u64[0] = 0;
-			pCache[index].data[way][2].b8._u64[1] = 0;
-			pCache[index].data[way][3].b8._u64[0] = 0;
-			pCache[index].data[way][3].b8._u64[1] = 0;
-
-			break;
-		}
-		case 0x1c: //DHWOIN (Data Cache Hit WriteBack Without Invalidate)
-		{
-			int index = (addr >> 6) & 0x3F;
-			int way = 0;
-			u32 pfnaddr = (pCache[index].tag[way] & ~0x80000fff) | (addr & 0xfc0); 
-			u32 vmv=vtlbdata.vmap[pfnaddr>>VTLB_PAGE_BITS];
-			s32 ppf=(pfnaddr+vmv) & ~0x3F;
-			u32 hand=(u8)vmv;
-			u32 paddr=ppf-hand+0x80000000;
-			
-			CACHE_LOG("CACHE DHWOIN addr %x, index %d, way %d, Flags %x OP %x",addr,index,way,pCache[index].tag[way] & 0x78, cpuRegs.code);
-
-			if ((pCache[index].tag[0] & ~0xFFF) == (paddr & ~0xFFF) && (pCache[index].tag[0] & VALID_FLAG))
-			{
-				way = 0;
-			}
-			else if((pCache[index].tag[1] & ~0xFFF) == (paddr & ~0xFFF) && (pCache[index].tag[1] & VALID_FLAG))
-			{
-				way = 1;
-			}
-			else
-			{
-				CACHE_LOG("CACHE DHWOIN NO HIT addr %x, index %d, phys %x tag0 %x tag1 %x",addr,index, paddr, pCache[index].tag[0], pCache[index].tag[1]);
-				return;
-			}
-
-			if((pCache[index].tag[way] & (DIRTY_FLAG|VALID_FLAG)) == (DIRTY_FLAG|VALID_FLAG))	// Dirty
-			{
-				CACHE_LOG("DHWOIN Dirty WriteBack! PPF %x", ppf);
-				*reinterpret_cast<mem64_t*>(ppf) = pCache[index].data[way][0].b8._u64[0];
-				*reinterpret_cast<mem64_t*>(ppf+8) =  pCache[index].data[way][0].b8._u64[1];
-				*reinterpret_cast<mem64_t*>(ppf+16) = pCache[index].data[way][1].b8._u64[0];
-				*reinterpret_cast<mem64_t*>(ppf+24) = pCache[index].data[way][1].b8._u64[1];
-				*reinterpret_cast<mem64_t*>(ppf+32) = pCache[index].data[way][2].b8._u64[0];
-				*reinterpret_cast<mem64_t*>(ppf+40) = pCache[index].data[way][2].b8._u64[1];
-				*reinterpret_cast<mem64_t*>(ppf+48) = pCache[index].data[way][3].b8._u64[0];
-				*reinterpret_cast<mem64_t*>(ppf+56) = pCache[index].data[way][3].b8._u64[1];
-
-				pCache[index].tag[way] &= ~DIRTY_FLAG;
-			}
-
-			break;
-		}
-		case 0x16: //DXIN (Data Cache Index Invalidate)
-		{
-			int index = (addr >> 6) & 0x3F;
-			int way = addr & 0x1;
-
-			CACHE_LOG("CACHE DXIN addr %x, index %d, way %d, flag %x\n",addr,index,way,pCache[index].tag[way] & 0x78);
-
-			pCache[index].tag[way] &= LRF_FLAG;
-
-		    pCache[index].data[way][0].b8._u64[0] = 0;
-		    pCache[index].data[way][0].b8._u64[1] = 0;
-		    pCache[index].data[way][1].b8._u64[0] = 0;
-		    pCache[index].data[way][1].b8._u64[1] = 0;
-		    pCache[index].data[way][2].b8._u64[0] = 0;
-		    pCache[index].data[way][2].b8._u64[1] = 0;
-		    pCache[index].data[way][3].b8._u64[0] = 0;
-		    pCache[index].data[way][3].b8._u64[1] = 0;
-			
-		   break;
-		}
-		case 0x11: //DXLDT (Data Cache Load Data into TagLo)
-		{
-			int index = (addr >> 6) & 0x3F;
-			int way = addr & 0x1;
-
-			cpuRegs.CP0.n.TagLo = pCache[index].data[way][(addr>>4) & 0x3].b8._u32[(addr&0xf)>>2];
-
-			CACHE_LOG("CACHE DXLDT addr %x, index %d, way %d, DATA %x OP %x",addr,index,way,cpuRegs.CP0.r[28], cpuRegs.code);
-
-			break;
-		}
-		case 0x10: //DXLTG (Data Cache Load Tag into TagLo)
-		{
-			int index = (addr >> 6) & 0x3F;
-			int way = addr & 0x1;
-
-			//DXLTG demands that SYNC.L is called before this command, which forces the cache to write back, so presumably games are checking the cache has updated the memory
-			//For speed, we will do it here.
-			u32 pfnaddr = (pCache[index].tag[way] & ~0x80000fff) | (addr & 0xfc0);
-			u32 vmv = vtlbdata.vmap[pfnaddr >> VTLB_PAGE_BITS];
-			s32 ppf = (pfnaddr + vmv) & ~0x3F;
-			if ((pCache[index].tag[way] & (DIRTY_FLAG | VALID_FLAG)) == (DIRTY_FLAG | VALID_FLAG))	// Dirty
-			{
-				CACHE_LOG("DXLTG Dirty WriteBack! PPF %x", ppf);
-				*reinterpret_cast<mem64_t*>(ppf) = pCache[index].data[way][0].b8._u64[0];
-				*reinterpret_cast<mem64_t*>(ppf + 8) = pCache[index].data[way][0].b8._u64[1];
-				*reinterpret_cast<mem64_t*>(ppf + 16) = pCache[index].data[way][1].b8._u64[0];
-				*reinterpret_cast<mem64_t*>(ppf + 24) = pCache[index].data[way][1].b8._u64[1];
-				*reinterpret_cast<mem64_t*>(ppf + 32) = pCache[index].data[way][2].b8._u64[0];
-				*reinterpret_cast<mem64_t*>(ppf + 40) = pCache[index].data[way][2].b8._u64[1];
-				*reinterpret_cast<mem64_t*>(ppf + 48) = pCache[index].data[way][3].b8._u64[0];
-				*reinterpret_cast<mem64_t*>(ppf + 56) = pCache[index].data[way][3].b8._u64[1];
-
-				pCache[index].tag[way] &= ~DIRTY_FLAG;
-			}
-			//DevCon.Warning("DXLTG way %x index %x addr %x tagdata=%x", way, index, addr, pCache[index].tag[way]);
-			cpuRegs.CP0.n.TagLo = pCache[index].tag[way];
-
-			CACHE_LOG("CACHE DXLTG addr %x, index %d, way %d, DATA %x OP %x ",addr,index,way,cpuRegs.CP0.r[28], cpuRegs.code);
-
-			break;
-		}
-		case 0x13: //DXSDT (Data Cache Store 32bits from TagLo)
-		{
-			int index = (addr >> 6) & 0x3F;
-			int way = addr & 0x1;
-
-			pCache[index].data[way][(addr>>4) & 0x3].b8._u32[(addr&0xf)>>2] = cpuRegs.CP0.n.TagLo;
-
-			CACHE_LOG("CACHE DXSDT addr %x, index %d, way %d, DATA %x OP %x",addr,index,way,cpuRegs.CP0.r[28], cpuRegs.code);
-
-			break;
-		}
-		case 0x12: //DXSTG (Data Cache Store Tag from TagLo)
-		{
-			int index = (addr >> 6) & 0x3F;
-			int way = addr & 0x1;
-			pCache[index].tag[way] = cpuRegs.CP0.n.TagLo; 
-
-			CACHE_LOG("CACHE DXSTG addr %x, index %d, way %d, DATA %x OP %x",addr,index,way,cpuRegs.CP0.r[28] & 0x6F, cpuRegs.code);
-
-			break;
-		}
-		case 0x14: //DXWBIN (Data Cache Index WriteBack Invalidate)
-		{
-			int index = (addr >> 6) & 0x3F;
-			int way = addr & 0x1;
-			u32 pfnaddr = (pCache[index].tag[way] & ~0x80000fff) + (addr & 0xFC0);
-			u32 vmv=vtlbdata.vmap[pfnaddr >>VTLB_PAGE_BITS];
-			s32 ppf=pfnaddr+vmv;
-			u32 hand=(u8)vmv;
-			u32 paddr=ppf-hand+0x80000000;
-
-			CACHE_LOG("CACHE DXWBIN addr %x, index %d, way %d, Flags %x Paddr %x tag %x",addr,index,way,pCache[index].tag[way] & 0x78, paddr, pCache[index].tag[way]);
-			if((pCache[index].tag[way] & (DIRTY_FLAG|VALID_FLAG)) == (DIRTY_FLAG|VALID_FLAG))	// Dirty
-			{		
-				ppf = (ppf & 0x7fffffff);
-				CACHE_LOG("DXWBIN Dirty WriteBack! PPF %x", ppf);
-
-				*reinterpret_cast<mem64_t*>(ppf) = pCache[index].data[way][0].b8._u64[0];
-				*reinterpret_cast<mem64_t*>(ppf+8) =  pCache[index].data[way][0].b8._u64[1];
-				*reinterpret_cast<mem64_t*>(ppf+16) = pCache[index].data[way][1].b8._u64[0];
-				*reinterpret_cast<mem64_t*>(ppf+24) = pCache[index].data[way][1].b8._u64[1];
-				*reinterpret_cast<mem64_t*>(ppf+32) = pCache[index].data[way][2].b8._u64[0];
-				*reinterpret_cast<mem64_t*>(ppf+40) = pCache[index].data[way][2].b8._u64[1];
-				*reinterpret_cast<mem64_t*>(ppf+48) = pCache[index].data[way][3].b8._u64[0];
-				*reinterpret_cast<mem64_t*>(ppf+56) = pCache[index].data[way][3].b8._u64[1];
-
-			}
-
-			pCache[index].tag[way] &= LRF_FLAG;
-
-			pCache[index].data[way][0].b8._u64[0] = 0;
-			pCache[index].data[way][0].b8._u64[1] = 0;
-			pCache[index].data[way][1].b8._u64[0] = 0;
-			pCache[index].data[way][1].b8._u64[1] = 0;
-			pCache[index].data[way][2].b8._u64[0] = 0;
-			pCache[index].data[way][2].b8._u64[1] = 0;
-			pCache[index].data[way][3].b8._u64[0] = 0;
-			pCache[index].data[way][3].b8._u64[1] = 0;
-			break;
-		}
-		case 0x7: //IXIN (Instruction Cache Index Invalidate)
-		{
-			//Not Implemented as we do not have instruction cache
-			break;
-		}
-		case 0xC: //BFH (BTAC Flush)
-		{
-			//Not Implemented as we do not cache Branch Target Addresses.
-			break;
-		}
-		default:
-			DevCon.Warning("Cache mode %x not impemented", _Rt_);
-			break;
-	}
+	*way = 0;
+	*idx = getFreeCache(mem, way, validPFN);
+	CacheLine line = cache.lineAt(*idx, *way);
+	if (Write)
+		line.tag.setDirty();
+	u32 aligned = mem & ~(Bytes - 1);
+	return &line.data.bytes[aligned & 0x3f];
 }
-}		// end namespace OpcodeImpl
 
-}}
+template <typename Int>
+void writeCache(u32 mem, Int value, bool validPFN)
+{
+	int way, idx;
+	void* addr = prepareCacheAccess<true, sizeof(Int)>(mem, &way, &idx, validPFN);
+
+	CACHE_LOG("writeCache%d %8.8x adding to %d, way %d, value %llx", 8 * sizeof(value), mem, idx, way, value);
+	*reinterpret_cast<Int*>(addr) = value;
+}
+
+void writeCache8(u32 mem, u8 value, bool validPFN)
+{
+	writeCache<u8>(mem, value, validPFN);
+}
+
+void writeCache16(u32 mem, u16 value, bool validPFN)
+{
+	writeCache<u16>(mem, value, validPFN);
+}
+
+void writeCache32(u32 mem, u32 value, bool validPFN)
+{
+	writeCache<u32>(mem, value, validPFN);
+}
+
+void writeCache64(u32 mem, const u64 value, bool validPFN)
+{
+	writeCache<u64>(mem, value, validPFN);
+}
+
+void writeCache128(u32 mem, const mem128_t* value, bool validPFN)
+{
+	int way, idx;
+	void* addr = prepareCacheAccess<true, sizeof(mem128_t)>(mem, &way, &idx, validPFN);
+
+	CACHE_LOG("writeCache128 %8.8x adding to %d, way %x, lo %llx, hi %llx", mem, idx, way, value->lo, value->hi);
+	*reinterpret_cast<mem128_t*>(addr) = *value;
+}
+
+template <typename Int>
+Int readCache(u32 mem, bool validPFN)
+{
+	int way, idx;
+	void* addr = prepareCacheAccess<false, sizeof(Int)>(mem, &way, &idx, validPFN);
+
+	Int value = *reinterpret_cast<Int*>(addr);
+	CACHE_LOG("readCache%d %8.8x from %d, way %d, value %llx", 8 * sizeof(value), mem, idx, way, value);
+	return value;
+}
+
+
+u8 readCache8(u32 mem, bool validPFN)
+{
+	return readCache<u8>(mem, validPFN);
+}
+
+u16 readCache16(u32 mem, bool validPFN)
+{
+	return readCache<u16>(mem, validPFN);
+}
+
+u32 readCache32(u32 mem, bool validPFN)
+{
+	return readCache<u32>(mem, validPFN);
+}
+
+u64 readCache64(u32 mem, bool validPFN)
+{
+	return readCache<u64>(mem, validPFN);
+}
+
+RETURNS_R128 readCache128(u32 mem, bool validPFN)
+{
+	int way, idx;
+	void* addr = prepareCacheAccess<false, sizeof(mem128_t)>(mem, &way, &idx, validPFN);
+	r128 value = r128_load(addr);
+	u64* vptr = reinterpret_cast<u64*>(&value);
+	CACHE_LOG("readCache128 %8.8x from %d, way %d, lo %llx, hi %llx", mem, idx, way, vptr[0], vptr[1]);
+	return value;
+}
+
+template <typename Op>
+void doCacheHitOp(u32 addr, const char* name, Op op)
+{
+	const int index = cache.setIdxFor(addr);
+	CacheSet& set = cache.sets[index];
+	VTLBVirtual vmv = vtlbdata.vmap[addr >> VTLB_PAGE_BITS];
+	uptr ppf = vmv.assumePtr(addr);
+	int way;
+
+	if (!findInCache(set, ppf, &way))
+	{
+		CACHE_LOG("CACHE %s NO HIT addr %x, index %d, tag0 %zx tag1 %zx", name, addr, index, set.tags[0].rawValue, set.tags[1].rawValue);
+		return;
+	}
+
+	CACHE_LOG("CACHE %s addr %x, index %d, way %d, flags %x OP %x", name, addr, index, way, set.tags[way].flags(), cpuRegs.code);
+
+	op(cache.lineAt(index, way));
+}
+
+namespace R5900
+{
+	namespace Interpreter
+	{
+		namespace OpcodeImpl
+		{
+
+			extern int Dcache;
+			void CACHE()
+			{
+				u32 addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
+				// CACHE_LOG("cpuRegs.GPR.r[_Rs_].UL[0] = %x, IMM = %x RT = %x", cpuRegs.GPR.r[_Rs_].UL[0], _Imm_, _Rt_);
+
+				switch (_Rt_)
+				{
+					case 0x1a: //DHIN (Data Cache Hit Invalidate)
+						doCacheHitOp(addr, "DHIN", [](CacheLine line) {
+							line.clear();
+						});
+						break;
+
+					case 0x18: //DHWBIN (Data Cache Hit WriteBack with Invalidate)
+						doCacheHitOp(addr, "DHWBIN", [](CacheLine line) {
+							line.writeBackIfNeeded();
+							line.clear();
+						});
+						break;
+
+					case 0x1c: //DHWOIN (Data Cache Hit WriteBack Without Invalidate)
+						doCacheHitOp(addr, "DHWOIN", [](CacheLine line) {
+							line.writeBackIfNeeded();
+						});
+						break;
+
+					case 0x16: //DXIN (Data Cache Index Invalidate)
+					{
+						const int index = cache.setIdxFor(addr);
+						const int way = addr & 0x1;
+						CacheLine line = cache.lineAt(index, way);
+
+						CACHE_LOG("CACHE DXIN addr %x, index %d, way %d, flag %x", addr, index, way, line.tag.flags());
+
+						line.clear();
+						break;
+					}
+
+					case 0x11: //DXLDT (Data Cache Load Data into TagLo)
+					{
+						const int index = cache.setIdxFor(addr);
+						const int way = addr & 0x1;
+						CacheLine line = cache.lineAt(index, way);
+
+						cpuRegs.CP0.n.TagLo = *reinterpret_cast<u32*>(&line.data.bytes[addr & 0x3C]);
+
+						CACHE_LOG("CACHE DXLDT addr %x, index %d, way %d, DATA %x OP %x", addr, index, way, cpuRegs.CP0.n.TagLo, cpuRegs.code);
+						break;
+					}
+
+					case 0x10: //DXLTG (Data Cache Load Tag into TagLo)
+					{
+						const int index = (addr >> 6) & 0x3F;
+						const int way = addr & 0x1;
+						CacheLine line = cache.lineAt(index, way);
+
+						// DXLTG demands that SYNC.L is called before this command, which forces the cache to write back, so presumably games are checking the cache has updated the memory
+						// For speed, we will do it here.
+						line.writeBackIfNeeded();
+
+						// Our tags don't contain PS2 paddrs (instead they contain x86 addrs)
+						cpuRegs.CP0.n.TagLo = line.tag.flags();
+
+						CACHE_LOG("CACHE DXLTG addr %x, index %d, way %d, DATA %x OP %x ", addr, index, way, cpuRegs.CP0.n.TagLo, cpuRegs.code);
+						CACHE_LOG("WARNING: DXLTG emulation supports flags only, things could break");
+						break;
+					}
+
+					case 0x13: //DXSDT (Data Cache Store 32bits from TagLo)
+					{
+						const int index = (addr >> 6) & 0x3F;
+						const int way = addr & 0x1;
+						CacheLine line = cache.lineAt(index, way);
+
+						*reinterpret_cast<u32*>(&line.data.bytes[addr & 0x3C]) = cpuRegs.CP0.n.TagLo;
+
+						CACHE_LOG("CACHE DXSDT addr %x, index %d, way %d, DATA %x OP %x", addr, index, way, cpuRegs.CP0.n.TagLo, cpuRegs.code);
+						break;
+					}
+
+					case 0x12: //DXSTG (Data Cache Store Tag from TagLo)
+					{
+						const int index = (addr >> 6) & 0x3F;
+						const int way = addr & 0x1;
+						CacheLine line = cache.lineAt(index, way);
+
+						line.tag.setAddr(cpuRegs.CP0.n.TagLo);
+						line.tag.rawValue &= ~CacheTag::ALL_FLAGS;
+						line.tag.rawValue |= (cpuRegs.CP0.n.TagLo & CacheTag::ALL_FLAGS);
+
+						CACHE_LOG("CACHE DXSTG addr %x, index %d, way %d, DATA %x OP %x", addr, index, way, cpuRegs.CP0.n.TagLo, cpuRegs.code);
+						break;
+					}
+
+					case 0x14: //DXWBIN (Data Cache Index WriteBack Invalidate)
+					{
+						const int index = (addr >> 6) & 0x3F;
+						const int way = addr & 0x1;
+						CacheLine line = cache.lineAt(index, way);
+
+						CACHE_LOG("CACHE DXWBIN addr %x, index %d, way %d, flags %x paddr %zx", addr, index, way, line.tag.flags(), line.addr());
+						line.writeBackIfNeeded();
+						line.clear();
+						break;
+					}
+
+					case 0x7: //IXIN (Instruction Cache Index Invalidate)
+					{
+						//Not Implemented as we do not have instruction cache
+						break;
+					}
+
+					case 0xC: //BFH (BTAC Flush)
+					{
+						//Not Implemented as we do not cache Branch Target Addresses.
+						break;
+					}
+
+					default:
+						DevCon.Warning("Cache mode %x not implemented", _Rt_);
+						break;
+				}
+			}
+		} // end namespace OpcodeImpl
+
+	} // namespace Interpreter
+} // namespace R5900

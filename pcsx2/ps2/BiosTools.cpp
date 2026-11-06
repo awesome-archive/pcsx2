@@ -1,145 +1,125 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
-#include "PrecompiledHeader.h"
+#include <cstdio>
+#include <cstring>
+
+#include "common/FileSystem.h"
+#include "common/Path.h"
+#include "common/StringUtil.h"
+#include "CDVD/CDVD.h"
+
 #include "Common.h"
 #include "BiosTools.h"
+#include "Config.h"
 
-#include "Utilities/pxStreams.h"
-#include "wx/ffile.h"
-
-
-// FIXME: Temporary hack until we remove dependence on Pcsx2App.
-#include "AppConfig.h"
-#include "wx/mstream.h"
-#include "wx/wfstream.h"
-
-#define DIRENTRY_SIZE 16
+static constexpr u32 MIN_BIOS_SIZE = 4 * _1mb;
+static constexpr u32 MAX_BIOS_SIZE = 8 * _1mb;
+static constexpr u32 DIRENTRY_SIZE = 16;
 
 // --------------------------------------------------------------------------------------
 // romdir structure (packing required!)
 // --------------------------------------------------------------------------------------
 //
-#if defined(_MSC_VER)
-#	pragma pack(1)
-#endif
+#pragma pack(push, 1)
 
 struct romdir
 {
 	char fileName[10];
 	u16 extInfoSize;
 	u32 fileSize;
-} __packed;			// +16
+};
 
-#ifdef _MSC_VER
-#	pragma pack()
-#endif
+#pragma pack(pop)
 
-static_assert( sizeof(romdir) == DIRENTRY_SIZE, "romdir struct not packed to 16 bytes" );
+static_assert(sizeof(romdir) == DIRENTRY_SIZE, "romdir struct not packed to 16 bytes");
 
 u32 BiosVersion;
 u32 BiosChecksum;
-wxString BiosDescription;
-const BiosDebugInformation* CurrentBiosInformation;
+u32 BiosRegion;
+ConfigParam configParams1;
+Config2Param configParams2;
+bool ParamsRead;
+bool NoOSD;
+bool AllowParams1;
+bool AllowParams2;
+std::string BiosDescription;
+std::string BiosZone;
+std::string BiosSerial;
+std::string BiosPath;
+BiosDebugInformation CurrentBiosInformation;
+std::vector<u8> BiosRom;
 
-const BiosDebugInformation biosVersions[] = {
-	// USA     v02.00(14/06/2004)  Console
-	{ 0x00000200, 0xD778DB8D, 0x8001a640 },
-	// Europe  v02.00(14/06/2004)
-	{ 0x00000200, 0X9C7B59D3, 0x8001a640 },
-};
-
-// --------------------------------------------------------------------------------------
-//  Exception::BiosLoadFailed  (implementations)
-// --------------------------------------------------------------------------------------
-Exception::BiosLoadFailed::BiosLoadFailed( const wxString& filename )
+void ReadOSDConfigParames()
 {
-	StreamName = filename;
+	if (ParamsRead)
+		return;
+
+	ParamsRead = true;
+
+	u8 params[16];
+	cdvdReadLanguageParams(params);
+
+	configParams1.UC[0] = params[1] & 0x1F; // SPDIF, Screen mode, RGB/Comp, Jap/Eng Switch (Early bios).
+	configParams1.ps1drvConfig = params[0]; // PS1 Mode Settings.
+	configParams1.version = (params[2] & 0xE0) >> 5; // OSD Ver (Not sure but best guess).
+	configParams1.language = params[2] & 0x1F; // Language.
+	configParams1.timezoneOffset = params[4] | ((u32)(params[3] & 0x7) << 8);  // Timezone offset in minutes.
+	configParams1.timeZoneID = params[6]; // ID for time zone selection
+	
+	// Region settings for time/date and extended language
+	configParams2.UC[1] = ((u32)params[3] & 0x78) << 1; // Daylight Savings, 24hr clock, Date format
+	configParams2.daylightSavings = configParams2.UC[1] & 0x10 ? 1 : 0;
+	configParams2.timeFormat = configParams2.UC[1] & 0x20 ? 1 : 0;
+	configParams2.dateFormat = configParams2.UC[1] & 0x80 ? 2 : (configParams2.UC[1] & 0x40 ? 1 : 0);
+	// FIXME: format, version and language are set manually by the bios. Not sure if any game needs them, but it seems to set version to 2 and duplicate the language value.
+	configParams2.version = 2;
+	configParams2.language = configParams1.language;
 }
 
-// This method throws a BadStream exception if the bios information chould not be obtained.
-//  (indicating that the file is invalid, incomplete, corrupted, or plain naughty).
-static void LoadBiosVersion( pxInputStream& fp, u32& version, wxString& description, wxString& zoneStr )
+static bool LoadBiosVersion(std::FILE* fp, u32& version, std::string& description, u32& region, std::string& zone, std::string& serial)
 {
-	uint i;
 	romdir rd;
-
-	for (i=0; i<512*1024; i++)
+	for (u32 i = 0; i < 512 * 1024; i++)
 	{
-		fp.Read( rd );
-		if (strncmp( rd.fileName, "RESET", 5 ) == 0)
+		if (std::fread(&rd, sizeof(rd), 1, fp) != 1)
+			return false;
+
+		if (std::strncmp(rd.fileName, "RESET", sizeof(rd.fileName)) == 0)
 			break; /* found romdir */
 	}
 
-	if (i == 512*1024)
-	{
-		throw Exception::BadStream( fp.GetStreamName() )
-			.SetDiagMsg(L"BIOS version check failed: 'RESET' tag could not be found.")
-			.SetUserMsg(_("The selected BIOS file is not a valid PS2 BIOS.  Please re-configure."));
-	}
+	s64 fileOffset = 0;
+	s64 fileSize = FileSystem::FSize64(fp);
+	bool foundRomVer = false;
+	char romver[14 + 1] = {}; // ascii version loaded from disk.
+	char extinfo[15 + 1] = {}; // ascii version loaded from disk.
 
-	uint fileOffset = 0;
-
-	while(strlen(rd.fileName) > 0)
+	// ensure it's a null-terminated and not zero-length string
+	while (rd.fileName[0] != '\0' && strnlen(rd.fileName, sizeof(rd.fileName)) != sizeof(rd.fileName))
 	{
-		if (strcmp(rd.fileName, "ROMVER") == 0)
+		if (std::strncmp(rd.fileName, "EXTINFO", sizeof(rd.fileName)) == 0)
 		{
-			char romver[14+1];		// ascii version loaded from disk.
-
-			wxFileOffset filetablepos = fp.Tell();
-			fp.Seek( fileOffset );
-			fp.Read( &romver, 14 );
-			fp.Seek( filetablepos );	//go back
-
-			romver[14] = 0;
-
-			const char zonefail[2] = { romver[4], '\0' };	// the default "zone" (unknown code)
-			const char* zone = zonefail;
-
-			switch(romver[4])
+			s64 pos = FileSystem::FTell64(fp);
+			if (FileSystem::FSeek64(fp, fileOffset + 0x10, SEEK_SET) != 0 ||
+				std::fread(extinfo, 15, 1, fp) != 1 || FileSystem::FSeek64(fp, pos, SEEK_SET) != 0)
 			{
-				case 'T': zone = "T10K";	break;
-				case 'X': zone = "Test";	break;
-				case 'J': zone = "Japan";	break;
-				case 'A': zone = "USA";		break;
-				case 'E': zone = "Europe";	break;
-				case 'H': zone = "HK";		break;
-				case 'P': zone = "Free";	break;
-				case 'C': zone = "China";	break;
+				break;
+			}
+			serial = extinfo;
+		}
+
+		if (std::strncmp(rd.fileName, "ROMVER", sizeof(rd.fileName)) == 0)
+		{
+
+			s64 pos = FileSystem::FTell64(fp);
+			if (FileSystem::FSeek64(fp, fileOffset, SEEK_SET) != 0 ||
+				std::fread(romver, 14, 1, fp) != 1 || FileSystem::FSeek64(fp, pos, SEEK_SET) != 0)
+			{
+				break;
 			}
 
-			char vermaj[3] = { romver[0], romver[1], 0 };
-			char vermin[3] = { romver[2], romver[3], 0 };
-
-			FastFormatUnicode result;
-			result.Write( "%-7s v%s.%s(%c%c/%c%c/%c%c%c%c)  %s",
-				zone,
-				vermaj, vermin,
-				romver[12], romver[13],	// day
-				romver[10], romver[11],	// month
-				romver[6], romver[7], romver[8], romver[9],	// year!
-				(romver[5]=='C') ? "Console" : (romver[5]=='D') ? "Devel" : ""
-			);
-
-			version = strtol(vermaj, (char**)NULL, 0) << 8;
-			version|= strtol(vermin, (char**)NULL, 0);
-
-			Console.WriteLn(L"Bios Found: %ls", result.c_str());
-
-			description = result.c_str();
-			zoneStr = fromUTF8(zone);
+			foundRomVer = true;
 		}
 
 		if ((rd.fileSize % 0x10) == 0)
@@ -147,37 +127,81 @@ static void LoadBiosVersion( pxInputStream& fp, u32& version, wxString& descript
 		else
 			fileOffset += (rd.fileSize + 0x10) & 0xfffffff0;
 
-		fp.Read( rd );
+		if (std::fread(&rd, sizeof(rd), 1, fp) != 1)
+			break;
 	}
 
 	fileOffset -= ((rd.fileSize + 0x10) & 0xfffffff0) - rd.fileSize;
 
-	if (description.IsEmpty())
-		throw Exception::BadStream( fp.GetStreamName() )
-			.SetDiagMsg(L"BIOS version check failed: 'ROMDIR' tag could not be found.")
-			.SetUserMsg(_("The selected BIOS file is not a valid PS2 BIOS.  Please re-configure."));
+	if (foundRomVer)
+	{
+		switch (romver[4])
+		{
+			// clang-format off
+			case 'J': zone = "Japan";  region = 0;  break;
+			case 'A': zone = "USA";    region = 1;  break;
+			case 'E': zone = "Europe"; region = 2;  break;
+			// case 'E': zone = "Oceania";region = 3;  break; // Not implemented
+			case 'H': zone = "Asia";   region = 4;  break;
+			// case 'E': zone = "Russia"; region = 3;  break; // Not implemented
+			case 'C': zone = "China";  region = 6;  break;
+			// case 'A': zone = "Mexico"; region = 7;  break; // Not implemented
+			case 'T': zone = (romver[5]=='Z') ? "COH-H" : "T10K";   region = 8;  break;
+			case 'X': zone = "Test";   region = 9;  break;
+			case 'P': zone = "Free";   region = 10; break;
+			// clang-format on
+			default:
+				zone.clear();
+				zone += romver[4];
+				region = 0;
+				break;
+		}
+		// TODO: some regions can be detected only from rom1
+		/* switch (rom1:DVDID[4])
+		{
+			// clang-format off
+			case 'O': zone = "Oceania";region = 3;  break;
+			case 'R': zone = "Russia"; region = 5;  break;
+			case 'M': zone = "Mexico"; region = 7;  break;
+			// clang-format on
+		} */
 
-	wxFileOffset fileSize = fp.Length();
+		char vermaj[3] = {romver[0], romver[1], 0};
+		char vermin[3] = {romver[2], romver[3], 0};
+		description = StringUtil::StdStringFromFormat("%-7s v%s.%s(%c%c/%c%c/%c%c%c%c)  %s %s",
+			zone.c_str(),
+			vermaj, vermin,
+			romver[12], romver[13], // day
+			romver[10], romver[11], // month
+			romver[6], romver[7], romver[8], romver[9], // year!
+			(romver[5] == 'C') ? "Console" : (romver[5] == 'D') ? "Devel" :
+																  "",
+			serial.c_str());
+
+		version = static_cast<u32>(strtol(vermaj, (char**)NULL, 0) << 8);
+		version |= strtol(vermin, (char**)NULL, 0);
+
+		Console.WriteLn("BIOS Found: %s", description.c_str());
+	}
+	else
+		return false;
+
 	if (fileSize < (int)fileOffset)
 	{
-		description += pxsFmt( L" %d%%", ((fileSize*100) / (int)fileOffset) );
+		description += StringUtil::StdStringFromFormat(" %d%%", (((int)fileSize * 100) / (int)fileOffset));
 		// we force users to have correct bioses,
 		// not that lame scph10000 of 513KB ;-)
 	}
+
+	return true;
 }
 
-static void LoadBiosVersion( pxInputStream& fp, u32& version, wxString& description )
+static void ChecksumIt(u32& result, u32 offset, u32 size)
 {
-	wxString zoneStr;
-	LoadBiosVersion( fp,version, description, zoneStr );
-}
-
-template< size_t _size >
-void ChecksumIt( u32& result, const u8 (&srcdata)[_size] )
-{
-	pxAssume( (_size & 3) == 0 );
-	for( size_t i=0; i<_size/4; ++i )
-		result ^= ((u32*)srcdata)[i];
+	const u8* srcdata = &BiosRom[offset];
+	pxAssume((size & 3) == 0);
+	for (size_t i = 0; i < size / 4; ++i)
+		result ^= reinterpret_cast<const u32*>(srcdata)[i];
 }
 
 // Attempts to load a BIOS rom sub-component, by trying multiple combinations of base
@@ -185,157 +209,180 @@ void ChecksumIt( u32& result, const u8 (&srcdata)[_size] )
 // the base.
 //
 // Parameters:
-//   ext - extension of the sub-component to load.  Valid options are rom1, rom2, AND erom.
+//   ext - extension of the sub-component to load. Valid options are rom1 and rom2.
 //
-template< size_t _size >
-static void LoadExtraRom( const wxChar* ext, u8 (&dest)[_size] )
+static void LoadExtraRom(const char* ext, u32 offset, u32 size)
 {
-	wxString Bios1;
-	s64 filesize = 0;
-
 	// Try first a basic extension concatenation (normally results in something like name.bin.rom1)
-	const wxString Bios( g_Conf->FullpathToBios() );
-	Bios1.Printf( L"%s.%s", WX_STR(Bios), ext);
+	std::string Bios1(StringUtil::StdStringFromFormat("%s.%s", BiosPath.c_str(), ext));
 
-	try
+	s64 filesize;
+	if ((filesize = FileSystem::GetPathFileSize(Bios1.c_str())) <= 0)
 	{
-		if( (filesize=Path::GetFileSize( Bios1 ) ) <= 0 )
+		// Try the name properly extensioned next (name.rom1)
+		Bios1 = Path::ReplaceExtension(BiosPath, ext);
+		if ((filesize = FileSystem::GetPathFileSize(Bios1.c_str())) <= 0)
 		{
-			// Try the name properly extensioned next (name.rom1)
-			Bios1 = Path::ReplaceExtension( Bios, ext );
-			if( (filesize=Path::GetFileSize( Bios1 ) ) <= 0 )
-			{
-				Console.WriteLn( Color_Gray, L"BIOS %s module not found, skipping...", ext );
-				return;
-			}
-		}
-
-		wxFile fp( Bios1 );
-		fp.Read( dest, std::min<s64>( _size, filesize ) );
-
-		// Checksum for ROM1, ROM2, EROM?  Rama says no, Gigaherz says yes.  I'm not sure either way.  --air
-		//ChecksumIt( BiosChecksum, dest );
-	}
-	catch (Exception::BadStream& ex)
-	{
-		// If any of the secondary roms fail,its a non-critical error.
-		// Log it, but don't make a big stink.  99% of games and stuff will
-		// still work fine.
-
-		Console.Warning(L"BIOS Warning: %s could not be read (permission denied?)", ext);
-		Console.Indent().WriteLn(L"Details: %s", WX_STR(ex.FormatDiagnosticMessage()));
-		Console.Indent().WriteLn(L"File size: %llu", filesize);
-	}
-}
-
-static void LoadIrx( const wxString& filename, u8* dest )
-{
-	s64 filesize = 0;
-	try
-	{
-		wxFile irx(filename);
-		if( (filesize=Path::GetFileSize( filename ) ) <= 0 ) {
-			Console.Warning(L"IRX Warning: %s could not be read", WX_STR(filename));
+			Console.WriteLn(Color_Gray, "BIOS %s module not found, skipping...", ext);
 			return;
 		}
+	}
 
-		irx.Read( dest, filesize );
-	}
-	catch (Exception::BadStream& ex)
+	BiosRom.resize(offset + size);
+
+	auto fp = FileSystem::OpenManagedCFileTryIgnoreCase(Bios1.c_str(), "rb");
+	if (!fp || std::fread(&BiosRom[offset], static_cast<size_t>(std::min<s64>(size, filesize)), 1, fp.get()) != 1)
 	{
-		Console.Warning(L"IRX Warning: %s could not be read", WX_STR(filename));
-		Console.Indent().WriteLn(L"Details: %s", WX_STR(ex.FormatDiagnosticMessage()));
+		Console.Warning("BIOS Warning: %s could not be read (permission denied?)", ext);
+		return;
 	}
+	// Checksum for ROM1, ROM2?  Rama says no, Gigaherz says yes.  I'm not sure either way.  --air
+	//ChecksumIt( BiosChecksum, dest );
+}
+
+static void LoadIrx(const std::string& filename, u8* dest, size_t maxSize)
+{
+	auto fp = FileSystem::OpenManagedCFile(filename.c_str(), "rb");
+	if (fp)
+	{
+		const s64 filesize = FileSystem::FSize64(fp.get());
+		const s64 readSize = std::min(filesize, static_cast<s64>(maxSize));
+		if (std::fread(dest, readSize, 1, fp.get()) == 1)
+			return;
+	}
+
+	Console.Warning("IRX Warning: %s could not be read", filename.c_str());
+	return;
+}
+
+static std::string FindBiosImage()
+{
+	Console.WriteLn("Searching for a BIOS image in '%s'...", EmuFolders::Bios.c_str());
+
+	FileSystem::FindResultsArray results;
+	if (!FileSystem::FindFiles(EmuFolders::Bios.c_str(), "*", FILESYSTEM_FIND_FILES, &results))
+		return std::string();
+
+	u32 version, region;
+	std::string description, zone;
+	for (const FILESYSTEM_FIND_DATA& fd : results)
+	{
+		if (fd.Size < MIN_BIOS_SIZE || fd.Size > MAX_BIOS_SIZE)
+			continue;
+
+		if (IsBIOS(fd.FileName.c_str(), version, description, region, zone))
+		{
+			Console.WriteLn("Using BIOS '%s' (%s %s)", fd.FileName.c_str(), description.c_str(), zone.c_str());
+			return std::move(fd.FileName);
+		}
+	}
+
+	Console.Error("Unable to auto locate a BIOS image");
+	return std::string();
+}
+
+bool IsBIOS(const char* filename, u32& version, std::string& description, u32& region, std::string& zone)
+{
+	std::string serial;
+	const auto fp = FileSystem::OpenManagedCFile(filename, "rb");
+	if (!fp)
+		return false;
+
+	// FPS2BIOS is smaller and of variable size
+	//if (inway.Length() < 512*1024) return false;
+	return LoadBiosVersion(fp.get(), version, description, region, zone, serial);
+}
+
+bool IsBIOSAvailable(const std::string& full_path)
+{
+	// We can't use EmuConfig here since it may not be loaded yet.
+	if (!full_path.empty() && FileSystem::FileExists(full_path.c_str()))
+		return true;
+
+	// No bios configured or the configured name is missing, check for one in the BIOS directory.
+	const std::string auto_path(FindBiosImage());
+	return !auto_path.empty() && FileSystem::FileExists(auto_path.c_str());
 }
 
 // Loads the configured bios rom file into PS2 memory.  PS2 memory must be allocated prior to
 // this method being called.
 //
 // Remarks:
-//   This function does not fail if rom1, rom2, or erom files are missing, since none are
+//   This function does not fail if rom1 or rom2 files are missing, since none are
 //   explicitly required for most emulation tasks.
 //
 // Exceptions:
 //   BadStream - Thrown if the primary bios file (usually .bin) is not found, corrupted, etc.
 //
-void LoadBIOS()
+bool LoadBIOS()
 {
-	pxAssertDev( eeMem->ROM != NULL, "PS2 system memory has not been initialized yet." );
+	pxAssertMsg(eeMem->ROM, "PS2 system memory has not been initialized yet.");
 
-	try
+	std::string path = EmuConfig.FullpathToBios();
+	if (path.empty() || !FileSystem::FileExists(path.c_str()))
 	{
-		wxString Bios( g_Conf->FullpathToBios() );
-		if( !g_Conf->BaseFilenames.Bios.IsOk() || g_Conf->BaseFilenames.Bios.IsDir() )
-			throw Exception::FileNotFound( Bios )
-				.SetDiagMsg(L"BIOS has not been configured, or the configuration has been corrupted.")
-				.SetUserMsg(_("The PS2 BIOS could not be loaded.  The BIOS has not been configured, or the configuration has been corrupted.  Please re-configure."));
-
-		s64 filesize = Path::GetFileSize( Bios );
-		if( filesize <= 0 )
+		if (!path.empty())
 		{
-			throw Exception::FileNotFound( Bios )
-				.SetDiagMsg(L"Configured BIOS file does not exist, or has a file size of zero.")
-				.SetUserMsg(_("The configured BIOS file does not exist.  Please re-configure."));
+			Console.Warning("Configured BIOS '%s' does not exist, trying to find an alternative.",
+				EmuConfig.BaseFilenames.Bios.c_str());
 		}
 
-		BiosChecksum = 0;
-
-		wxString biosZone;
-		wxFFile fp( Bios );
-		fp.Read( eeMem->ROM, std::min<s64>( Ps2MemSize::Rom, filesize ) );
-
-		ChecksumIt( BiosChecksum, eeMem->ROM );
-
-		pxInputStream memfp( Bios, new wxMemoryInputStream( eeMem->ROM, sizeof(eeMem->ROM) ) );
-		LoadBiosVersion( memfp, BiosVersion, BiosDescription, biosZone );
-
-		Console.SetTitle( pxsFmt( L"Running BIOS (%s v%u.%u)",
-			WX_STR(biosZone), BiosVersion >> 8, BiosVersion & 0xff
-		));
-
-		//injectIRX("host.irx");	//not fully tested; still buggy
-
-		LoadExtraRom( L"rom1", eeMem->ROM1 );
-		LoadExtraRom( L"rom2", eeMem->ROM2 );
-		LoadExtraRom( L"erom", eeMem->EROM );
-
-		if (g_Conf->CurrentIRX.Length() > 3)
-			LoadIrx(g_Conf->CurrentIRX, &eeMem->ROM[0x3C0000]);
-
-		CurrentBiosInformation = NULL;
-		for (size_t i = 0; i < sizeof(biosVersions)/sizeof(biosVersions[0]); i++)
-		{
-			if (biosVersions[i].biosChecksum == BiosChecksum && biosVersions[i].biosVersion == BiosVersion)
-			{
-				CurrentBiosInformation = &biosVersions[i];
-				break;
-			}
-		}
+		path = FindBiosImage();
+		if (path.empty())
+			return false;
 	}
-	catch (Exception::BadStream& ex)
+
+	auto fp = FileSystem::OpenManagedCFile(path.c_str(), "rb");
+	if (!fp)
+		return false;
+
+	const s64 filesize = FileSystem::FSize64(fp.get());
+	if (filesize <= 0)
+		return false;
+
+	LoadBiosVersion(fp.get(), BiosVersion, BiosDescription, BiosRegion, BiosZone, BiosSerial);
+
+	BiosRom.resize(Ps2MemSize::Rom);
+
+	if (FileSystem::FSeek64(fp.get(), 0, SEEK_SET) ||
+		std::fread(BiosRom.data(), static_cast<size_t>(std::min<s64>(Ps2MemSize::Rom, filesize)), 1, fp.get()) != 1)
 	{
-		// Rethrow as a Bios Load Failure, so that the user interface handling the exceptions
-		// can respond to it appropriately.
-		throw Exception::BiosLoadFailed( ex.StreamName )
-			.SetDiagMsg( ex.DiagMsg() )
-			.SetUserMsg( ex.UserMsg() );
+		return false;
 	}
+
+	// If file is less than 2mb it doesn't have an OSD (Devel consoles)
+	// So skip HLEing OSDSys Param stuff
+	if (filesize < 2465792)
+		NoOSD = true;
+	else
+		NoOSD = false;
+
+	BiosChecksum = 0;
+	ChecksumIt(BiosChecksum, 0, Ps2MemSize::Rom);
+	BiosPath = std::move(path);
+
+	//injectIRX("host.irx");	//not fully tested; still buggy
+
+	LoadExtraRom("rom1", Ps2MemSize::Rom, Ps2MemSize::Rom1);
+	LoadExtraRom("rom2", Ps2MemSize::Rom + Ps2MemSize::Rom1, Ps2MemSize::Rom2);
+	return true;
 }
 
-bool IsBIOS(const wxString& filename, wxString& description)
+void CopyBIOSToMemory()
 {
-	wxFileName Bios( g_Conf->Folders.Bios + filename );
-	pxInputStream inway( filename, new wxFFileInputStream( filename ) );
+	if (BiosRom.size() >= Ps2MemSize::Rom)
+	{
+		std::memcpy(eeMem->ROM, BiosRom.data(), sizeof(eeMem->ROM));
+		if (BiosRom.size() >= (Ps2MemSize::Rom + Ps2MemSize::Rom1))
+		{
+			std::memcpy(eeMem->ROM1, BiosRom.data() + Ps2MemSize::Rom, sizeof(eeMem->ROM1));
+			if (BiosRom.size() >= (Ps2MemSize::Rom + Ps2MemSize::Rom1 + Ps2MemSize::Rom2))
+				std::memcpy(eeMem->ROM2, BiosRom.data() + Ps2MemSize::Rom + Ps2MemSize::Rom1, sizeof(eeMem->ROM2));
+		}
+	}
 
-	if (!inway.IsOk()) return false;
-	// FPS2BIOS is smaller and of variable size
-	//if (inway.Length() < 512*1024) return false;
+	if (EmuConfig.CurrentIRX.length() > 3)
+		LoadIrx(EmuConfig.CurrentIRX, &eeMem->ROM[0x3C0000], sizeof(eeMem->ROM) - 0x3C0000);
 
-	try {
-		u32 version;
-		LoadBiosVersion( inway, version, description );
-		return true;
-	} catch( Exception::BadStream& ) { }
-
-	return false;	// fail quietly
+	CurrentBiosInformation.eeThreadListAddr = 0;
 }

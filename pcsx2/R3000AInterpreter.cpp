@@ -1,22 +1,15 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
+#include "R3000A.h"
+#include "Common.h"
+#include "Config.h"
+#include "VMManager.h"
 
-#include "PrecompiledHeader.h"
-#include "IopCommon.h"
-#include "App.h" // For host irx injection hack
+#include "R5900OpcodeTables.h"
+#include "DebugTools/Breakpoints.h"
+#include "IopBios.h"
+#include "IopHw.h"
 
 using namespace R3000A;
 
@@ -123,13 +116,110 @@ void psxJALR()
 	doBranch(_u32(_rRs_));
 }
 
+void psxBreakpoint(bool memcheck)
+{
+	u32 pc = psxRegs.pc;
+	if (CBreakPoints::CheckSkipFirst(BREAKPOINT_IOP, pc) != 0)
+	{
+		CBreakPoints::ClearSkipFirst(BREAKPOINT_IOP);
+		return;
+	}
+
+	if (!memcheck)
+	{
+		auto cond = CBreakPoints::GetBreakPointCondition(BREAKPOINT_IOP, pc);
+		if (cond && !cond->Evaluate())
+			return;
+
+		if (!CBreakPoints::HandleBreakpointHit(BREAKPOINT_IOP, pc))
+			return;
+	}
+
+	CBreakPoints::SetBreakpointTriggered(true, BREAKPOINT_IOP);
+	VMManager::SetPaused(true);
+	Cpu->ExitExecution();
+}
+
+void psxMemcheck(u32 op, u32 bits, bool store)
+{
+	// compute accessed address
+	u32 start = psxRegs.GPR.r[(op >> 21) & 0x1F];
+	if ((s16)op != 0)
+		start += (s16)op;
+
+	u32 end = start + bits / 8;
+
+	const auto checks = CBreakPoints::GetMemChecks(BREAKPOINT_IOP);
+	for (size_t i = 0; i < checks.size(); i++)
+	{
+		const auto& check = checks[i];
+
+		if (check.result == 0)
+			continue;
+		if ((check.memCond & MEMCHECK_WRITE) == 0 && store)
+			continue;
+		if ((check.memCond & MEMCHECK_READ) == 0 && !store)
+			continue;
+
+		if (check.hasCond)
+		{
+			if (!check.cond.Evaluate())
+				continue;
+		}
+
+		if (start < check.end && check.start < end)
+			psxBreakpoint(true);
+	}
+}
+
+void psxCheckMemcheck()
+{
+	u32 pc = psxRegs.pc;
+	int needed = psxIsMemcheckNeeded(pc);
+	if (needed == 0)
+		return;
+
+	u32 op = iopMemRead32(needed == 2 ? pc + 4 : pc);
+	// Yeah, we use the R5900 opcode table for the R3000
+	const R5900::OPCODE& opcode = R5900::GetInstruction(op);
+
+	bool store = (opcode.flags & IS_STORE) != 0;
+	switch (opcode.flags & MEMTYPE_MASK)
+	{
+	case MEMTYPE_BYTE:
+		psxMemcheck(op, 8, store);
+		break;
+	case MEMTYPE_HALF:
+		psxMemcheck(op, 16, store);
+		break;
+	case MEMTYPE_WORD:
+		psxMemcheck(op, 32, store);
+		break;
+	case MEMTYPE_DWORD:
+		psxMemcheck(op, 64, store);
+		break;
+	}
+}
+
 ///////////////////////////////////////////
 // These macros are used to assemble the repassembler functions
 
 static __fi void execI()
 {
+	// This function is called for every instruction.
+	// Enabling the define below will probably, no, will cause the interpretor to be slower.
+//#define EXTRA_DEBUG
+#if defined(EXTRA_DEBUG) || defined(PCSX2_DEVBUILD)
+	if (psxIsBreakpointNeeded(psxRegs.pc))
+		psxBreakpoint(false);
+
+	psxCheckMemcheck();
+	
+	CBreakPoints::CommitClearSkipFirst(BREAKPOINT_IOP);
+#endif
+
 	// Inject IRX hack
-	if (psxRegs.pc == 0x1630 && g_Conf->CurrentIRX.Length() > 3) {
+	if (psxRegs.pc == 0x1630 && EmuConfig.CurrentIRX.length() > 3) {
 		if (iopMemRead32(0x20018) == 0x1F) {
 			// FIXME do I need to increase the module count (0x1F -> 0x20)
 			iopMemWrite32(0x20094, 0xbffc0000);
@@ -142,20 +232,28 @@ static __fi void execI()
 
 	psxRegs.pc+= 4;
 	psxRegs.cycle++;
-	
-	if ((psxHu32(HW_ICFG) & (1 << 3)))
-	{
-		//One of the Iop to EE delta clocks to be set in PS1 mode.
-		iopCycleEE-=9;
-	}
-	else
-	{   //default ps2 mode value
-		iopCycleEE-=8;
-	}
+
 	psxBSC[psxRegs.code >> 26]();
 }
 
 static void doBranch(s32 tar) {
+	if (tar == 0x0)
+		DevCon.Warning("[R3000 Interpreter] Warning: Branch to 0x0!");
+
+	// When upgrading the IOP, there are two resets, the second of which is a 'fake' reset
+	// This second 'reset' involves UDNL calling SYSMEM and LOADCORE directly, resetting LOADCORE's modules
+	// This detects when SYSMEM is called and clears the modules then
+	if(tar == 0x890)
+	{
+		DevCon.WriteLn(Color_Gray, "R3000 Debugger: Branch to 0x890 (SYSMEM). Clearing modules.");
+		R3000SymbolGuardian.ClearIrxModules();
+	}
+
+	// Override the memory size argument to IOPBOOT
+	if(static_cast<u32>(tar) == 0xbfc4a000) {
+		psxRegs.GPR.n.a0 = Ps2MemSize::ExposedIopRam >> 20;
+	}
+
 	branch2 = iopIsDelaySlot = true;
 	branchPC = tar;
 	execI();
@@ -176,25 +274,42 @@ static void intReset() {
 	intAlloc();
 }
 
-static void intExecute() {
-	for (;;) execI();
-}
-
 static s32 intExecuteBlock( s32 eeCycles )
 {
-	iopBreak = 0;
-	iopCycleEE = eeCycles;
+	psxRegs.iopBreak = 0;
+	psxRegs.iopCycleEE = eeCycles;
+	u64 lastIOPCycle = 0;
 
-	while (iopCycleEE > 0){
+	while (psxRegs.iopCycleEE > 0)
+	{
+		lastIOPCycle = psxRegs.cycle;
 		if ((psxHu32(HW_ICFG) & 8) && ((psxRegs.pc & 0x1fffffffU) == 0xa0 || (psxRegs.pc & 0x1fffffffU) == 0xb0 || (psxRegs.pc & 0x1fffffffU) == 0xc0))
 			psxBiosCall();
 
 		branch2 = 0;
-		while (!branch2) {
+		while (!branch2)
 			execI();
-        }
+
+		
+		if ((psxHu32(HW_ICFG) & (1 << 3)))
+		{
+			// F = gcd(PS2CLK, PSXCLK) = 230400
+			const u32 cnum = 1280; // PS2CLK / F
+			const u32 cdenom = 147; // PSXCLK / F
+
+			//One of the Iop to EE delta clocks to be set in PS1 mode.
+			const u32 t = ((cnum * (psxRegs.cycle - lastIOPCycle)) + psxRegs.iopCycleEECarry);
+			psxRegs.iopCycleEE -= t / cdenom;
+			psxRegs.iopCycleEECarry = t % cdenom;
+		}
+		else
+		{ 
+			//default ps2 mode value
+			psxRegs.iopCycleEE -= (psxRegs.cycle - lastIOPCycle) * 8;
+		}
 	}
-	return iopBreak + iopCycleEE;
+
+	return psxRegs.iopBreak + psxRegs.iopCycleEE;
 }
 
 static void intClear(u32 Addr, u32 Size) {
@@ -203,23 +318,10 @@ static void intClear(u32 Addr, u32 Size) {
 static void intShutdown() {
 }
 
-static void intSetCacheReserve( uint reserveInMegs )
-{
-}
-
-static uint intGetCacheReserve()
-{
-	return 0;
-}
-
 R3000Acpu psxInt = {
 	intReserve,
 	intReset,
-	intExecute,
 	intExecuteBlock,
 	intClear,
-	intShutdown,
-
-	intGetCacheReserve,
-	intSetCacheReserve
+	intShutdown
 };

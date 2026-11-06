@@ -1,32 +1,14 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
-
-
-#include "PrecompiledHeader.h"
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
 #include "Common.h"
 #include "R5900OpcodeTables.h"
-#include "iR5900.h"
+#include "x86/iR5900.h"
 
 using namespace x86Emitter;
 
-namespace R5900 {
-namespace Dynarec {
-namespace OpcodeImpl
+namespace R5900::Dynarec::OpcodeImpl
 {
-
 /*********************************************************
 * Arithmetic with immediate operand                      *
 * Format:  OP rt, rs, immediate                          *
@@ -49,33 +31,37 @@ REC_FUNC_DEL(SLTIU, _Rt_);
 
 #else
 
+static void recMoveStoT(int info)
+{
+	if (info & PROCESS_EE_S)
+		xMOV(xRegister32(EEREC_T), xRegister32(EEREC_S));
+	else
+		xMOV(xRegister32(EEREC_T), ptr32[&cpuRegs.GPR.r[_Rs_].UL[0]]);
+}
+
+static void recMoveStoT64(int info)
+{
+	if (info & PROCESS_EE_S)
+		xMOV(xRegister64(EEREC_T), xRegister64(EEREC_S));
+	else
+		xMOV(xRegister64(EEREC_T), ptr64[&cpuRegs.GPR.r[_Rs_].UD[0]]);
+}
+
 //// ADDI
-void recADDI_const( void )
+static void recADDI_const(void)
 {
-	g_cpuConstRegs[_Rt_].SD[0] = (s64)(g_cpuConstRegs[_Rs_].SL[0] + (s32)_Imm_);
+	g_cpuConstRegs[_Rt_].SD[0] = s64(s32(g_cpuConstRegs[_Rs_].UL[0] + u32(s32(_Imm_))));
 }
 
-void recADDI_(int info)
+static void recADDI_(int info)
 {
-	pxAssert( !(info&PROCESS_EE_XMM) );
-
-	if ( _Rt_ == _Rs_ ) {
-		// must perform the ADD unconditionally, to maintain flags status:
-		xADD(ptr32[&cpuRegs.GPR.r[ _Rt_ ].UL[ 0 ]], _Imm_);
-		_signExtendSFtoM( (uptr)&cpuRegs.GPR.r[ _Rt_ ].UL[ 1 ]);
-	}
-	else {
-		xMOV(eax, ptr[&cpuRegs.GPR.r[ _Rs_ ].UL[ 0 ] ]);
-
-		if ( _Imm_ != 0 ) xADD(eax, _Imm_ );
-
-		xCDQ( );
-		xMOV(ptr[&cpuRegs.GPR.r[ _Rt_ ].UL[ 0 ]], eax);
-		xMOV(ptr[&cpuRegs.GPR.r[ _Rt_ ].UL[ 1 ]], edx);
-	}
+	pxAssert(!(info & PROCESS_EE_XMM));
+	recMoveStoT(info);
+	xADD(xRegister32(EEREC_T), _Imm_);
+	xMOVSX(xRegister64(EEREC_T), xRegister32(EEREC_T));
 }
 
-EERECOMPILE_CODEX(eeRecompileCode1, ADDI);
+EERECOMPILE_CODEX(eeRecompileCodeRC1, ADDI, XMMINFO_WRITET | XMMINFO_READS);
 
 ////////////////////////////////////////////////////
 void recADDIU()
@@ -84,37 +70,19 @@ void recADDIU()
 }
 
 ////////////////////////////////////////////////////
-void recDADDI_const()
+static void recDADDI_const()
 {
-	g_cpuConstRegs[_Rt_].SD[0] = g_cpuConstRegs[_Rs_].SD[0] + (s64)_Imm_;
+	g_cpuConstRegs[_Rt_].UD[0] = g_cpuConstRegs[_Rs_].UD[0] + u64(s64(_Imm_));
 }
 
-void recDADDI_(int info)
+static void recDADDI_(int info)
 {
-	pxAssert( !(info&PROCESS_EE_XMM) );
-
-	if( _Rt_ == _Rs_ ) {
-		xADD(ptr32[&cpuRegs.GPR.r[ _Rt_ ].UL[ 0 ]], _Imm_);
-		xADC(ptr32[&cpuRegs.GPR.r[ _Rt_ ].UL[ 1 ]], _Imm_<0?0xffffffff:0);
-	}
-	else {
-		xMOV(eax, ptr[&cpuRegs.GPR.r[ _Rs_ ].UL[ 0 ] ]);
-
-		xMOV(edx, ptr[&cpuRegs.GPR.r[ _Rs_ ].UL[ 1 ] ]);
-
-		if ( _Imm_ != 0 )
-		{
-			xADD(eax, _Imm_ );
-			xADC(edx, _Imm_ < 0?0xffffffff:0);
-		}
-
-		xMOV(ptr[&cpuRegs.GPR.r[ _Rt_ ].UL[ 0 ]], eax);
-
-		xMOV(ptr[&cpuRegs.GPR.r[ _Rt_ ].UL[ 1 ]], edx);
-	}
+	pxAssert(!(info & PROCESS_EE_XMM));
+	recMoveStoT64(info);
+	xADD(xRegister64(EEREC_T), _Imm_);
 }
 
-EERECOMPILE_CODEX(eeRecompileCode1, DADDI);
+EERECOMPILE_CODEX(eeRecompileCodeRC1, DADDI, XMMINFO_WRITET | XMMINFO_READS | XMMINFO_64BITOP);
 
 //// DADDIU
 void recDADDIU()
@@ -123,156 +91,138 @@ void recDADDIU()
 }
 
 //// SLTIU
-void recSLTIU_const()
+static void recSLTIU_const()
 {
 	g_cpuConstRegs[_Rt_].UD[0] = g_cpuConstRegs[_Rs_].UD[0] < (u64)(_Imm_);
 }
 
-extern void recSLTmemconstt(int regd, int regs, u32 mem, int sign);
-extern u32 s_sltone;
-
-void recSLTIU_(int info)
+static void recSLTIU_(int info)
 {
-	xMOV(eax, 1);
+	pxAssert(!(info & PROCESS_EE_XMM));
 
-	xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 1 ]], _Imm_ >= 0 ? 0 : 0xffffffff);
-	j8Ptr[0] = JB8( 0 );
-	j8Ptr[2] = JA8( 0 );
+	// TODO(Stenzek): this can be made to suck less by turning Rs into a temp and reallocating Rt.
+	const xRegister32 dreg((_Rt_ == _Rs_) ? _allocX86reg(X86TYPE_TEMP, 0, 0) : EEREC_T);
+	xXOR(dreg, dreg);
 
-	xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 0 ]], (s32)_Imm_ );
-	j8Ptr[1] = JB8(0);
+	if (info & PROCESS_EE_S)
+		xCMP(xRegister64(EEREC_S), _Imm_);
+	else
+		xCMP(ptr64[&cpuRegs.GPR.r[_Rs_].UD[0]], _Imm_);
 
-	x86SetJ8(j8Ptr[2]);
-	xXOR(eax, eax);
+	xSETB(xRegister8(dreg));
 
-	x86SetJ8(j8Ptr[0]);
-	x86SetJ8(j8Ptr[1]);
-
-	xMOV(ptr[&cpuRegs.GPR.r[ _Rt_ ].UL[ 0 ]], eax);
-	xMOV(ptr32[&cpuRegs.GPR.r[ _Rt_ ].UL[ 1 ]], 0 );
+	if (dreg.GetId() != EEREC_T)
+	{
+		std::swap(x86regs[dreg.GetId()], x86regs[EEREC_T]);
+		_freeX86reg(EEREC_T);
+	}
 }
 
-EERECOMPILE_CODEX(eeRecompileCode1, SLTIU);
+EERECOMPILE_CODEX(eeRecompileCodeRC1, SLTIU, XMMINFO_WRITET | XMMINFO_READS | XMMINFO_64BITOP | XMMINFO_NORENAME);
 
 //// SLTI
-void recSLTI_const()
+static void recSLTI_const()
 {
 	g_cpuConstRegs[_Rt_].UD[0] = g_cpuConstRegs[_Rs_].SD[0] < (s64)(_Imm_);
 }
 
-void recSLTI_(int info)
+static void recSLTI_(int info)
 {
-	// test silent hill if modding
-	xMOV(eax, 1);
+	const xRegister32 dreg((_Rt_ == _Rs_) ? _allocX86reg(X86TYPE_TEMP, 0, 0) : EEREC_T);
+	xXOR(dreg, dreg);
 
-	xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 1 ]], _Imm_ >= 0 ? 0 : 0xffffffff);
-	j8Ptr[0] = JL8( 0 );
-	j8Ptr[2] = JG8( 0 );
+	if (info & PROCESS_EE_S)
+		xCMP(xRegister64(EEREC_S), _Imm_);
+	else
+		xCMP(ptr64[&cpuRegs.GPR.r[_Rs_].UD[0]], _Imm_);
 
-	xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 0 ]], (s32)_Imm_ );
-	j8Ptr[1] = JB8(0);
+	xSETL(xRegister8(dreg));
 
-	x86SetJ8(j8Ptr[2]);
-	xXOR(eax, eax);
-
-	x86SetJ8(j8Ptr[0]);
-	x86SetJ8(j8Ptr[1]);
-
-	xMOV(ptr[&cpuRegs.GPR.r[ _Rt_ ].UL[ 0 ]], eax);
-	xMOV(ptr32[&cpuRegs.GPR.r[ _Rt_ ].UL[ 1 ]], 0 );
+	if (dreg.GetId() != EEREC_T)
+	{
+		std::swap(x86regs[dreg.GetId()], x86regs[EEREC_T]);
+		_freeX86reg(EEREC_T);
+	}
 }
 
-EERECOMPILE_CODEX(eeRecompileCode1, SLTI);
+EERECOMPILE_CODEX(eeRecompileCodeRC1, SLTI, XMMINFO_WRITET | XMMINFO_READS | XMMINFO_64BITOP | XMMINFO_NORENAME);
 
 //// ANDI
-void recANDI_const()
+static void recANDI_const()
 {
 	g_cpuConstRegs[_Rt_].UD[0] = g_cpuConstRegs[_Rs_].UD[0] & (u64)_ImmU_; // Zero-extended Immediate
 }
 
-void recLogicalOpI(int info, int op)
+namespace
 {
-	if ( _ImmU_ != 0 )
+enum class LogicalOp
+{
+	AND,
+	OR,
+	XOR
+};
+} // namespace
+
+static void recLogicalOpI(int info, LogicalOp op)
+{
+	xImpl_G1Logic* bad = nullptr;
+	const xImpl_G1Logic& xOP = op == LogicalOp::AND ? xAND
+	                         : op == LogicalOp::OR  ? xOR
+	                         : op == LogicalOp::XOR ? xXOR
+	                         : *bad;
+	pxAssert(&xOP != bad);
+
+	if (_ImmU_ != 0)
 	{
-		if( _Rt_ == _Rs_ ) {
-			switch(op) {
-				case 0: xAND(ptr32[&cpuRegs.GPR.r[ _Rt_ ].UL[ 0 ]], _ImmU_); break;
-				case 1: xOR(ptr32[&cpuRegs.GPR.r[ _Rt_ ].UL[ 0 ]], _ImmU_); break;
-				case 2: xXOR(ptr32[&cpuRegs.GPR.r[ _Rt_ ].UL[ 0 ]], _ImmU_); break;
-				default: pxAssert(0);
-			}
-		}
-		else {
-			xMOV(eax, ptr[&cpuRegs.GPR.r[ _Rs_ ].UL[ 0 ] ]);
-			if( op != 0 )
-				xMOV(edx, ptr[&cpuRegs.GPR.r[ _Rs_ ].UL[ 1 ] ]);
-
-			switch(op) {
-				case 0: xAND(eax, _ImmU_); break;
-				case 1: xOR(eax, _ImmU_); break;
-				case 2: xXOR(eax, _ImmU_); break;
-				default: pxAssert(0);
-			}
-
-			if( op != 0 )
-				xMOV(ptr[&cpuRegs.GPR.r[ _Rt_ ].UL[ 1 ]], edx);
-			xMOV(ptr[&cpuRegs.GPR.r[ _Rt_ ].UL[ 0 ]], eax);
-		}
-
-		if( op == 0 ) {
-			xMOV(ptr32[&cpuRegs.GPR.r[ _Rt_ ].UL[ 1 ]], 0 );
-		}
+		recMoveStoT64(info);
+		xOP(xRegister64(EEREC_T), _ImmU_);
 	}
 	else
 	{
-		if( op == 0 ) {
-			xMOV(ptr32[&cpuRegs.GPR.r[ _Rt_ ].UL[ 0 ]], 0 );
-			xMOV(ptr32[&cpuRegs.GPR.r[ _Rt_ ].UL[ 1 ]], 0 );
+		if (op == LogicalOp::AND)
+		{
+			xXOR(xRegister32(EEREC_T), xRegister32(EEREC_T));
 		}
-		else {
-			if( _Rt_ != _Rs_ ) {
-				xMOV(eax, ptr[&cpuRegs.GPR.r[ _Rs_ ].UL[ 0 ] ]);
-				xMOV(edx, ptr[&cpuRegs.GPR.r[ _Rs_ ].UL[ 1 ] ]);
-				xMOV(ptr[&cpuRegs.GPR.r[ _Rt_ ].UL[ 0 ]], eax);
-				xMOV(ptr[&cpuRegs.GPR.r[ _Rt_ ].UL[ 1 ]], edx);
-			}
+		else
+		{
+			recMoveStoT64(info);
 		}
 	}
 }
 
-void recANDI_(int info)
+static void recANDI_(int info)
 {
-	recLogicalOpI(info, 0);
+	recLogicalOpI(info, LogicalOp::AND);
 }
 
-EERECOMPILE_CODEX(eeRecompileCode1, ANDI);
+EERECOMPILE_CODEX(eeRecompileCodeRC1, ANDI, XMMINFO_WRITET | XMMINFO_READS | XMMINFO_64BITOP);
 
 ////////////////////////////////////////////////////
-void recORI_const()
+static void recORI_const()
 {
 	g_cpuConstRegs[_Rt_].UD[0] = g_cpuConstRegs[_Rs_].UD[0] | (u64)_ImmU_; // Zero-extended Immediate
 }
 
-void recORI_(int info)
+static void recORI_(int info)
 {
-	recLogicalOpI(info, 1);
+	recLogicalOpI(info, LogicalOp::OR);
 }
 
-EERECOMPILE_CODEX(eeRecompileCode1, ORI);
+EERECOMPILE_CODEX(eeRecompileCodeRC1, ORI, XMMINFO_WRITET | XMMINFO_READS | XMMINFO_64BITOP);
 
 ////////////////////////////////////////////////////
-void recXORI_const()
+static void recXORI_const()
 {
 	g_cpuConstRegs[_Rt_].UD[0] = g_cpuConstRegs[_Rs_].UD[0] ^ (u64)_ImmU_; // Zero-extended Immediate
 }
 
-void recXORI_(int info)
+static void recXORI_(int info)
 {
-	recLogicalOpI(info, 2);
+	recLogicalOpI(info, LogicalOp::XOR);
 }
 
-EERECOMPILE_CODEX(eeRecompileCode1, XORI);
+EERECOMPILE_CODEX(eeRecompileCodeRC1, XORI, XMMINFO_WRITET | XMMINFO_READS | XMMINFO_64BITOP);
 
 #endif
 
-} } }
+} // namespace R5900::Dynarec::OpcodeImpl

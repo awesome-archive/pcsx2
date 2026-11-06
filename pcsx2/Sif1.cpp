@@ -1,28 +1,17 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
-
-#include "PrecompiledHeader.h"
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
 #define _PC_	// disables MIPS opcode macros.
 
-#include "IopCommon.h"
+#include "R3000A.h"
+#include "Common.h"
 #include "Sif.h"
+#include "IopHw.h"
 
 _sif sif1;
 
 static bool done = false;
+static bool sif1_dma_stall = false;
 
 static __fi void Sif1Init()
 {
@@ -99,16 +88,16 @@ static __fi bool ProcessEETag()
 		sif1.fifo.write((u32*)ptag + 2, 2);
 	}
 
-	if (sif1ch.chcr.TIE && ptag->IRQ)
-	{
-		Console.WriteLn("SIF1 TIE");
-		sif1.ee.end = true;
-	}
-
-	SIF_LOG(wxString(ptag->tag_to_str()).To8BitData());
+	SIF_LOG("%s", ptag->tag_to_str().c_str());
 	sif1ch.madr = ptag[1]._u32;
 
 	sif1.ee.end = hwDmacSrcChain(sif1ch, ptag->ID);
+
+	if (sif1ch.chcr.TIE && ptag->IRQ)
+	{
+		//Console.WriteLn("SIF1 TIE");
+		sif1.ee.end = true;
+	}
 
 	return true;
 }
@@ -125,7 +114,7 @@ static __fi bool SIFIOPReadTag()
 	// Only use the first 24 bits.
 	hw_dma10.madr = sif1data & 0xffffff;
 
-	
+
 	if (sif1words > 0xFFFFC) DevCon.Warning("SIF1 Overrun %x", sif1words);
 	//Maximum transfer amount 1mb-16 also masking out top part which is a "Mode" cache stuff, we don't care :)
 	sif1.iop.counter = sif1words & 0xFFFFC;
@@ -151,7 +140,7 @@ static __fi void EndEE()
 		sif1.ee.cycles = 1;
 	}
 
-
+	CPU_SET_DMASTALL(DMAC_SIF1, false);
 	CPU_INT(DMAC_SIF1, /*std::min((int)(*/sif1.ee.cycles*BIAS/*), 384)*/);
 }
 
@@ -186,10 +175,6 @@ static __fi void HandleEETransfer()
 		sif1.ee.busy = false;
 		return;
 	}
-	if (dmacRegs.ctrl.STD == STD_SIF1)
-	{
-		DevCon.Warning("SIF1 stall control Not Implemented"); // STD == fromSIF1
-	}
 
 	/*if (sif1ch.qwc == 0)
 		if (sif1ch.chcr.MOD == NORMAL_MODE)
@@ -216,6 +201,22 @@ static __fi void HandleEETransfer()
 	}
 	else
 	{
+		if (dmacRegs.ctrl.STD == STD_SIF1)
+		{
+			if ((sif1ch.chcr.MOD == NORMAL_MODE) || ((sif1ch.chcr.TAG >> 28) & 0x7) == TAG_REFS)
+			{
+				//DevCon.Warning("SIF1 Stall Control");
+				const int writeSize = std::min((s32)sif1ch.qwc, sif1.fifo.sif_free() >> 2);
+				if ((sif1ch.madr + (writeSize * 16)) > dmacRegs.stadr.ADDR)
+				{
+					hwDmacIrq(DMAC_STALL_SIS);
+					sif1_dma_stall = true;
+					CPU_SET_DMASTALL(DMAC_SIF1, true);
+					return;
+				}
+			}
+				//DevCon.Warning("SIF1 stall control Not Implemented"); // STD == fromSIF1
+		}
 		if (sif1.fifo.sif_free() > 0)
 		{
 			WriteEEtoFifo();
@@ -262,6 +263,15 @@ static __fi void Sif1End()
 __fi void SIF1Dma()
 {
 	int BusyCheck = 0;
+
+	if (sif1_dma_stall)
+	{
+		const int writeSize = std::min((s32)sif1ch.qwc, sif1.fifo.sif_free() >> 2);
+		if ((sif1ch.madr + (writeSize * 16)) > dmacRegs.stadr.ADDR)
+			return;
+	}
+
+	sif1_dma_stall = false;
 	Sif1Init();
 
 	do
@@ -269,7 +279,7 @@ __fi void SIF1Dma()
 		//I realise this is very hacky in a way but its an easy way of checking if both are doing something
 		BusyCheck = 0;
 
-		if (sif1.ee.busy)
+		if (sif1.ee.busy && !sif1_dma_stall)
 		{
 			if(sif1.fifo.sif_free() > 0 || (sif1.ee.end && sif1ch.qwc == 0))
 			{
@@ -308,7 +318,7 @@ __fi void  EEsif1Interrupt()
 // Main difference is this checks for iop, where psxDma10 checks for ee.
 __fi void dmaSIF1()
 {
-	SIF_LOG(wxString(L"dmaSIF1" + sif1ch.cmqt_to_str()).To8BitData());
+	SIF_LOG("dmaSIF1 %s", sif1ch.cmqt_to_str().c_str());
 
 	if (sif1.fifo.readPos != sif1.fifo.writePos)
 	{
@@ -318,14 +328,14 @@ __fi void dmaSIF1()
 	psHu32(SBUS_F240) |= 0x4000;
 	sif1.ee.busy = true;
 
-
-	// Okay, this here is needed currently (r3644). 
+	CPU_SET_DMASTALL(DMAC_SIF1, false);
+	// Okay, this here is needed currently (r3644).
 	// FFX battles in the thunder plains map die otherwise, Phantasy Star 4 as well
 	// These 2 games could be made playable again by increasing the time the EE or the IOP run,
 	// showing that this is very timing sensible.
 	// Doing this DMA unfortunately brings back an old warning in Legend of Legaia though, but it still works.
 
-	//Updated 23/08/2011: The hangs are caused by the EE suspending SIF1 DMA and restarting it when in the middle 
+	//Updated 23/08/2011: The hangs are caused by the EE suspending SIF1 DMA and restarting it when in the middle
 	//of processing a "REFE" tag, so the hangs can be solved by forcing the ee.end to be false
 	// (as it should always be at the beginning of a DMA).  using "if iop is busy" flags breaks Tom Clancy Rainbow Six.
 	// Legend of Legaia doesn't throw a warning either :)
@@ -337,7 +347,7 @@ __fi void dmaSIF1()
 		{
 			sif1.ee.end = true;
 		}
-	}	
+	}
 
 	SIF1Dma();
 

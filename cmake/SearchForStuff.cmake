@@ -1,215 +1,144 @@
 #-------------------------------------------------------------------------------
-#						Search all libraries on the system
+#                       Search all libraries on the system
 #-------------------------------------------------------------------------------
-## Use cmake package to find module
-if (Linux)
-    find_package(ALSA)
-    find_package(PCAP)
-    find_package(LibXml2)
-endif()
-find_package(Freetype) # GSdx OSD
-find_package(Gettext) # translation tool
-if(EXISTS ${PROJECT_SOURCE_DIR}/.git)
-    find_package(Git)
-endif()
-find_package(LibLZMA)
+find_package(Git)
 
-# Using find_package OpenGL without either setting your opengl preference to GLVND or LEGACY
-# is deprecated as of cmake 3.11.
-set(OpenGL_GL_PREFERENCE GLVND)
-find_package(OpenGL)
-find_package(PNG)
-find_package(Vtune)
-# The requirement of wxWidgets is checked in SelectPcsx2Plugins module
-# Does not require the module (allow to compile non-wx plugins)
-# Force the unicode build (the variable is only supported on cmake 2.8.3 and above)
-# Warning do not put any double-quote for the argument...
-# set(wxWidgets_CONFIG_OPTIONS --unicode=yes --debug=yes) # In case someone want to debug inside wx
-#
-# Fedora uses an extra non-standard option ... Arch must be the first option.
-# They do uname -m if missing so only fix for cross compilations.
-# http://pkgs.fedoraproject.org/cgit/wxGTK.git/plain/wx-config
-if(Fedora AND CMAKE_CROSSCOMPILING)
-    set(wxWidgets_CONFIG_OPTIONS --arch ${PCSX2_TARGET_ARCHITECTURES} --unicode=yes)
+# Require threads on all OSes.
+find_package(Threads REQUIRED)
+
+# Dependency libraries.
+# On macOS, Mono.framework contains an ancient version of libpng.  We don't want that.
+# Avoid it by telling cmake to avoid finding frameworks while we search for libpng.
+set(FIND_FRAMEWORK_BACKUP ${CMAKE_FIND_FRAMEWORK})
+set(CMAKE_FIND_FRAMEWORK NEVER)
+find_package(PNG 1.6.40 REQUIRED)
+find_package(JPEG REQUIRED) # No version because flatpak uses libjpeg-turbo.
+find_package(ZLIB REQUIRED) # v1.3, but Mac uses the SDK version.
+find_package(Zstd 1.5.5 REQUIRED)
+find_package(LZ4 REQUIRED)
+find_package(WebP REQUIRED) # v1.3.2, spews an error on Linux because no pkg-config.
+find_package(SDL3 3.2.6 REQUIRED)
+find_package(Freetype 2.10 REQUIRED) # 2.10 is the first with COLRv0 support, which we need for rendering emoji
+find_package(plutovg 1.1.0 REQUIRED)
+find_package(plutosvg 0.0.7 REQUIRED)
+find_package(ryml REQUIRED)
+find_package(FFMPEG 7.1 COMPONENTS avcodec avformat avutil swresample swscale REQUIRED)
+if (WIN32)
+	find_package(DirectX-Headers 1.618.1 REQUIRED)
+endif()
+
+if(USE_VULKAN)
+	find_package(Shaderc REQUIRED)
+endif()
+
+# Platform-specific dependencies.
+if (WIN32)
+	add_subdirectory(3rdparty/D3D12MemAlloc EXCLUDE_FROM_ALL)
+	add_subdirectory(3rdparty/winpixeventruntime EXCLUDE_FROM_ALL)
+	add_subdirectory(3rdparty/winwil EXCLUDE_FROM_ALL)
+	find_package(Vtune)
 else()
-    set(wxWidgets_CONFIG_OPTIONS --unicode=yes)
-endif()
+	find_package(CURL REQUIRED)
+	find_package(PCAP REQUIRED)
+	find_package(Vtune)
 
-list(APPEND wxWidgets_CONFIG_OPTIONS --version=3.0)
+	## Use CheckLib package to find module
+	include(CheckLib)
 
-if(GTK3_API AND NOT APPLE)
-    list(APPEND wxWidgets_CONFIG_OPTIONS --toolkit=gtk3)
-elseif(NOT APPLE)
-    list(APPEND wxWidgets_CONFIG_OPTIONS --toolkit=gtk2)
-endif()
+	if(UNIX AND NOT APPLE)
+		find_package(Fontconfig REQUIRED)
+		if(LINUX)
+			check_lib(LIBUDEV libudev libudev.h)
+		endif()
 
-# wx2.8 => /usr/bin/wx-config-2.8
-# lib32-wx2.8 => /usr/bin/wx-config32-2.8
-# wx3.0 => /usr/bin/wx-config-3.0
-# I'm going to take a wild guess and predict this:
-# lib32-wx3.0 => /usr/bin/wx-config32-3.0
-# FindwxWidgets only searches for wx-config.
-if(CMAKE_CROSSCOMPILING)
-    # May need to fix the filenames for lib32-wx3.0.
-    if(${PCSX2_TARGET_ARCHITECTURES} MATCHES "i386")
-        if (Fedora AND EXISTS "/usr/bin/wx-config-3.0")
-            set(wxWidgets_CONFIG_EXECUTABLE "/usr/bin/wx-config-3.0")
-        endif()
-        if (EXISTS "/usr/bin/wx-config32")
-            set(wxWidgets_CONFIG_EXECUTABLE "/usr/bin/wx-config32")
-        endif()
-        if (EXISTS "/usr/bin/wx-config32-3.0")
-            set(wxWidgets_CONFIG_EXECUTABLE "/usr/bin/wx-config32-3.0")
-        endif()
-    endif()
-else()
-    if (${CMAKE_SYSTEM_NAME} MATCHES "FreeBSD")
-        set(wxWidgets_CONFIG_EXECUTABLE "/usr/local/bin/wxgtk2u-3.0-config")
-    endif()
-    if(EXISTS "/usr/bin/wx-config-3.0")
-        set(wxWidgets_CONFIG_EXECUTABLE "/usr/bin/wx-config-3.0")
-    endif()
-endif()
+		if(X11_API)
+			find_package(X11 REQUIRED)
+			if (NOT X11_Xrandr_FOUND)
+				message(FATAL_ERROR "XRandR extension is required")
+			endif()
+		endif()
 
-find_package(wxWidgets COMPONENTS base core adv)
-find_package(ZLIB)
+		if(WAYLAND_API)
+			find_package(ECM REQUIRED NO_MODULE)
+			list(APPEND CMAKE_MODULE_PATH "${ECM_MODULE_PATH}")
+			find_package(Wayland REQUIRED Egl)
+		endif()
 
-## Use pcsx2 package to find module
-include(FindLibc)
+		if(USE_BACKTRACE)
+			find_package(Libbacktrace REQUIRED)
+		endif()
 
-## Only needed by the extra plugins
-if(EXTRA_PLUGINS)
-    include(FindCg)
-    include(FindGlew)
-    find_package(JPEG)
-endif()
-
-## Use CheckLib package to find module
-include(CheckLib)
-if(Linux)
-    check_lib(AIO aio libaio.h)
-    # There are two udev pkg config files - udev.pc (wrong), libudev.pc (correct)
-    # When cross compiling, pkg-config will be skipped so we have to look for
-    # udev (it'll automatically be prefixed with lib). But when not cross
-    # compiling, we have to look for libudev.pc. Argh. Hence the silliness below.
-    if(CMAKE_CROSSCOMPILING)
-        check_lib(LIBUDEV udev libudev.h)
-    else()
-        check_lib(LIBUDEV libudev libudev.h)
-    endif()
-endif()
-if(EGL_API)
-    check_lib(EGL EGL EGL/egl.h)
-    check_lib(X11_XCB X11-xcb X11/Xlib-xcb.h)
-endif()
-if(OPENCL_API)
-    check_lib(OPENCL OpenCL CL/cl.hpp)
-endif()
-check_lib(PORTAUDIO portaudio portaudio.h pa_linux_alsa.h)
-check_lib(SOUNDTOUCH SoundTouch soundtouch/SoundTouch.h)
-
-if(SDL2_API)
-    check_lib(SDL2 SDL2 SDL.h PATH_SUFFIXES SDL2)
-else()
-    # Tell cmake that we use SDL as a library and not as an application
-    set(SDL_BUILDING_LIBRARY TRUE)
-    find_package(SDL)
-endif()
-
-if(UNIX)
-    find_package(X11)
-    # Most plugins (if not all) and PCSX2 core need gtk2, so set the required flags
-    if (GTK3_API)
-        if(CMAKE_CROSSCOMPILING)
-            find_package(GTK3 REQUIRED gtk)
-        else()
-            check_lib(GTK3 gtk+-3.0 gtk/gtk.h)
-        endif()
-    else()
-        find_package(GTK2 REQUIRED gtk)
-    endif()
-endif()
-
-#----------------------------------------
-#		    Use system include
-#----------------------------------------
-if(UNIX)
-	if(GTK2_FOUND)
-		include_directories(${GTK2_INCLUDE_DIRS})
-    elseif(GTK3_FOUND)
-		include_directories(${GTK3_INCLUDE_DIRS})
-        # A lazy solution
-        set(GTK2_LIBRARIES ${GTK3_LIBRARIES})
-	endif()
-
-	if(X11_FOUND)
-		include_directories(${X11_INCLUDE_DIR})
+		find_package(PkgConfig REQUIRED)
+		pkg_check_modules(DBUS REQUIRED dbus-1)
 	endif()
 endif()
 
-if(ALSA_FOUND)
-	include_directories(${ALSA_INCLUDE_DIRS})
+set(CMAKE_FIND_FRAMEWORK ${FIND_FRAMEWORK_BACKUP})
+
+add_subdirectory(3rdparty/fast_float EXCLUDE_FROM_ALL)
+add_subdirectory(3rdparty/lzma EXCLUDE_FROM_ALL)
+add_subdirectory(3rdparty/libchdr EXCLUDE_FROM_ALL)
+disable_compiler_warnings_for_target(libchdr)
+add_subdirectory(3rdparty/soundtouch EXCLUDE_FROM_ALL)
+add_subdirectory(3rdparty/simpleini EXCLUDE_FROM_ALL)
+add_subdirectory(3rdparty/imgui EXCLUDE_FROM_ALL)
+add_subdirectory(3rdparty/cpuinfo EXCLUDE_FROM_ALL)
+disable_compiler_warnings_for_target(cpuinfo)
+add_subdirectory(3rdparty/libzip EXCLUDE_FROM_ALL)
+add_subdirectory(3rdparty/rcheevos EXCLUDE_FROM_ALL)
+add_subdirectory(3rdparty/rapidjson EXCLUDE_FROM_ALL)
+add_subdirectory(3rdparty/discord-rpc EXCLUDE_FROM_ALL)
+add_subdirectory(3rdparty/freesurround EXCLUDE_FROM_ALL)
+
+if(USE_OPENGL)
+	add_subdirectory(3rdparty/glad EXCLUDE_FROM_ALL)
 endif()
 
-if(CG_FOUND)
-	include_directories(${CG_INCLUDE_DIRS})
+if(USE_VULKAN)
+	add_subdirectory(3rdparty/vulkan EXCLUDE_FROM_ALL)
 endif()
 
-if(JPEG_FOUND)
-	include_directories(${JPEG_INCLUDE_DIR})
+add_subdirectory(3rdparty/cubeb EXCLUDE_FROM_ALL)
+disable_compiler_warnings_for_target(cubeb)
+disable_compiler_warnings_for_target(speex)
+
+# Find the Qt components that we need.
+if(ENABLE_QT_UI)
+	find_package(Qt6 6.10 COMPONENTS CoreTools Core GuiTools Gui WidgetsTools Widgets LinguistTools REQUIRED)
+
+	if(NOT WIN32 AND NOT APPLE)
+		if (Qt6_VERSION VERSION_GREATER_EQUAL 6.10.0)
+			find_package(Qt6 COMPONENTS CorePrivate GuiPrivate WidgetsPrivate REQUIRED)
+		endif()
+	endif()
+
+	# The docking system for the debugger.
+	find_package(KDDockWidgets-qt6 2.3.0 REQUIRED)
 endif()
 
-if(GLEW_FOUND)
-    include_directories(${GLEW_INCLUDE_DIR})
+if(WIN32 AND ARCH_X86)
+	add_subdirectory(3rdparty/rainterface EXCLUDE_FROM_ALL)
 endif()
 
-if(OPENGL_FOUND)
-	include_directories(${OPENGL_INCLUDE_DIR})
+# Demangler for the debugger.
+add_subdirectory(3rdparty/demangler EXCLUDE_FROM_ALL)
+
+# Symbol table parser.
+add_subdirectory(3rdparty/ccc EXCLUDE_FROM_ALL)
+
+# Architecture-specific.
+if(ARCH_X86)
+	add_subdirectory(3rdparty/zydis EXCLUDE_FROM_ALL)
+elseif(ARCH_ARM64)
+	add_subdirectory(3rdparty/vixl EXCLUDE_FROM_ALL)
 endif()
 
-if(SDL_FOUND AND NOT SDL2_API)
-	include_directories(${SDL_INCLUDE_DIR})
-endif()
+# Prevent fmt from being built with exceptions, or being thrown at call sites.
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DFMT_USE_EXCEPTIONS=0 -DFMT_USE_RTTI=0")
+add_subdirectory(3rdparty/fmt EXCLUDE_FROM_ALL)
 
-if(USE_VTUNE AND VTUNE_FOUND)
-    include_directories(${VTUNE_INCLUDE_DIRS})
-endif()
-
-if(wxWidgets_FOUND)
-	include(${wxWidgets_USE_FILE})
-endif()
-
-if(PCAP_FOUND)
-	include_directories(${PCAP_INCLUDE_DIR})
-endif()
-
-if(LIBXML2_FOUND)
-	include_directories(${LIBXML2_INCLUDE_DIRS})
-endif()
-
-if(ZLIB_FOUND)
-	include_directories(${ZLIB_INCLUDE_DIRS})
-endif()
-
-#----------------------------------------
-#  Use  project-wide include directories
-#----------------------------------------
-include_directories(${CMAKE_SOURCE_DIR}/common/include
-					${CMAKE_SOURCE_DIR}/common/include/Utilities
-					${CMAKE_SOURCE_DIR}/common/include/x86emitter
-                    # File generated by Cmake
-                    ${CMAKE_BINARY_DIR}/common/include
-                    )
-
-#----------------------------------------
-# Check correctness of the parameter
-# Note: wxWidgets_INCLUDE_DIRS must be defined
-#----------------------------------------
-include(ApiValidation)
-
-WX_vs_SDL()
-
-# Blacklist bad GCC
-if(GCC_VERSION VERSION_EQUAL "7.0" OR GCC_VERSION VERSION_EQUAL "7.1")
-    GCC7_BUG()
+# Deliberately at the end. We don't want to set the flag on third-party projects.
+if(MSVC)
+	# Don't warn about "deprecated" POSIX functions.
+	add_definitions("-D_CRT_NONSTDC_NO_WARNINGS" "-D_CRT_SECURE_NO_WARNINGS" "-DCRT_SECURE_NO_DEPRECATE")
 endif()

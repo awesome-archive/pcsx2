@@ -1,24 +1,12 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
-
-#include "PrecompiledHeader.h"
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
 #define _PC_	// disables MIPS opcode macros.
 
-#include "IopCommon.h"
+#include "R3000A.h"
+#include "Common.h"
 #include "Sif.h"
+#include "IopHw.h"
 
 _sif sif0;
 
@@ -58,6 +46,13 @@ static __fi bool WriteFifoToEE()
 	sif0.ee.cycles += readSize;	// fixme : BIAS is factored in above
 	sif0ch.qwc -= readSize;
 
+	if (sif0ch.qwc == 0 && dmacRegs.ctrl.STS == STS_SIF0)
+	{
+		//DevCon.Warning("SIF0 Stall Control");
+		if ((sif0ch.chcr.MOD == NORMAL_MODE) || ((sif0ch.chcr.TAG >> 28) & 0x7) == TAG_CNTS)
+			dmacRegs.stadr.ADDR = sif0ch.madr;
+	}
+
 	return true;
 }
 
@@ -73,8 +68,9 @@ static __fi bool WriteIOPtoFifo()
 	hw_dma9.madr += writeSize << 2;
 
 	// iop is 1/8th the clock rate of the EE and psxcycles is in words (not quadwords).
-	sif0.iop.cycles += (writeSize >> 2)/* * BIAS*/;		// fixme : should be >> 4
+	sif0.iop.cycles += writeSize; //1 word per cycle
 	sif0.iop.counter -= writeSize;
+
 
 	return true;
 }
@@ -82,7 +78,7 @@ static __fi bool WriteIOPtoFifo()
 // Read Fifo into an ee tag, transfer it to sif0ch, and process it.
 static __fi bool ProcessEETag()
 {
-	static __aligned16 u32 tag[4];
+	alignas(16) static u32 tag[4];
 	tDMA_TAG& ptag(*(tDMA_TAG*)tag);
 
 	sif0.fifo.read((u32*)&tag[0], 4); // Tag
@@ -105,8 +101,8 @@ static __fi bool ProcessEETag()
 		case TAG_CNT:	break;
 
 		case TAG_CNTS:
-			if (dmacRegs.ctrl.STS == STS_SIF0)
-				dmacRegs.stadr.ADDR = sif0ch.madr + (sif0ch.qwc * 16);
+			if (dmacRegs.ctrl.STS == STS_SIF0) // STS == SIF0 - Initial Value
+					dmacRegs.stadr.ADDR = sif0ch.madr;
 			break;
 
 		case TAG_END:
@@ -121,26 +117,28 @@ static __fi bool ProcessIOPTag()
 {
 	// Process DMA tag at hw_dma9.tadr
 	sif0.iop.data = *(sifData *)iopPhysMem(hw_dma9.tadr);
-	sif0.iop.data.words = (sif0.iop.data.words + 3) & 0xfffffffc; // Round up to nearest 4.
+	sif0.iop.data.words = sif0.iop.data.words;
 
-	// send the EE's side of the DMAtag.  The tag is only 64 bits, with the upper 64 bits
-	// ignored by the EE.
+	// send the EE's side of the DMAtag.  The tag is only 64 bits, with the upper 64 bits being the next IOP tag
+	// ignored by the EE, however required for alignment and used as junk data in small packets.
+	sif0.fifo.write((u32*)iopPhysMem(hw_dma9.tadr + 8), 4);
 
-	sif0.fifo.write((u32*)iopPhysMem(hw_dma9.tadr + 8), 2);
-	sif0.fifo.writePos = (sif0.fifo.writePos + 2) & (FIFO_SIF_W - 1);		// iggy on the upper 64.
-	sif0.fifo.size += 2;
-
-	hw_dma9.tadr += 16; ///hw_dma9.madr + 16 + sif0.sifData.words << 2;
+	// I know we just sent 1QW, because of the size of the EE read, but only 64bits was valid
+	// so we advance by 64bits after the EE tag to get the next IOP tag.
+	hw_dma9.tadr += 16;
 
 	// We're only copying the first 24 bits.  Bits 30 and 31 (checked below) are Stop/IRQ bits.
 	hw_dma9.madr = sif0data & 0xFFFFFF;
-	if (sif0words > 0xFFFFC) DevCon.Warning("SIF0 Overrun %x", sif0words);
+	if (sif0words > 0xFFFFF) DevCon.Warning("SIF0 Overrun %x", sif0words);
 	//Maximum transfer amount 1mb-16 also masking out top part which is a "Mode" cache stuff, we don't care :)
-	sif0.iop.counter = sif0words & 0xFFFFC;
+	sif0.iop.counter = sif0words & 0xFFFFF;
+
+	// Save the number of words we need to write to make up 1QW from this packet. (See "Junk data writing" in Sif.h)
+	sif0.iop.writeJunk = (sif0.iop.counter & 0x3) ? (4 - sif0.iop.counter & 0x3) : 0;
 
 	// IOP tags have an IRQ bit and an End of Transfer bit:
 	if (sif0tag.IRQ  || (sif0tag.ID & 4)) sif0.iop.end = true;
-	SIF_LOG("SIF0 IOP Tag: madr=%lx, tadr=%lx, counter=%lx (%08X_%08X)", hw_dma9.madr, hw_dma9.tadr, sif0.iop.counter, sif0words, sif0data);
+	SIF_LOG("SIF0 IOP Tag: madr=%lx, tadr=%lx, counter=%lx (%08X_%08X) Junk %d", hw_dma9.madr, hw_dma9.tadr, sif0.iop.counter, sif0words, sif0data, sif0.iop.writeJunk);
 
 	return true;
 }
@@ -156,7 +154,7 @@ static __fi void EndEE()
 		SIF_LOG("SIF0 EE: cycles = 0");
 		sif0.ee.cycles = 1;
 	}
-
+	CPU_SET_DMASTALL(DMAC_SIF0, false);
 	CPU_INT(DMAC_SIF0, sif0.ee.cycles*BIAS);
 }
 
@@ -173,9 +171,12 @@ static __fi void EndIOP()
 		DevCon.Warning("SIF0 IOP: cycles = 0");
 		sif0.iop.cycles = 1;
 	}
-	// iop is 1/8th the clock rate of the EE and psxcycles is in words (not quadwords)
-	// So when we're all done, the equation looks like thus:
-	//PSX_INT(IopEvt_SIF0, ( ( sif0.iop.cycles*BIAS ) / 4 ) / 8);
+	// Hack alert
+	// Parappa the rapper hates SIF0 taking the length of time it should do on bigger packets
+	// I logged it and couldn't work out why, changing any other SIF timing (EE or IOP) seems to have no effect.
+	if (sif0.iop.cycles > 1000)
+		sif0.iop.cycles >>= 1; //2 word per cycle
+
 	PSX_INT(IopEvt_SIF0, sif0.iop.cycles);
 }
 
@@ -188,11 +189,6 @@ static __fi void HandleEETransfer()
 		sif0.ee.end = false;
 		sif0.ee.busy = false;
 		return;
-	}
-
-	if (dmacRegs.ctrl.STS == STS_SIF0)
-	{
-		DevCon.Warning("SIF0 stall control not properly implemented");
 	}
 
 	/*if (sif0ch.qwc == 0)
@@ -222,7 +218,7 @@ static __fi void HandleEETransfer()
 	if (sif0ch.qwc > 0) // If we're writing something, continue to do so.
 	{
 		// Write from Fifo to EE.
-		if (sif0.fifo.size > 0)
+		if (sif0.fifo.size >= 4)
 		{
 			WriteFifoToEE();
 		}
@@ -304,6 +300,13 @@ __fi void SIF0Dma()
 		//I realise this is very hacky in a way but its an easy way of checking if both are doing something
 		BusyCheck = 0;
 
+		if (sif0.iop.counter == 0 && sif0.iop.writeJunk && sif0.fifo.sif_free() >= sif0.iop.writeJunk)
+		{
+			SIF_LOG("Writing Junk %d", sif0.iop.writeJunk);
+			sif0.fifo.writeJunk(sif0.iop.writeJunk);
+			sif0.iop.writeJunk = 0;
+		}
+
 		if (sif0.iop.busy)
 		{
 			if(sif0.fifo.sif_free() > 0 || (sif0.iop.end && sif0.iop.counter == 0))
@@ -339,7 +342,7 @@ __fi void  EEsif0Interrupt()
 
 __fi void dmaSIF0()
 {
-	SIF_LOG(wxString(L"dmaSIF0" + sif0ch.cmqt_to_str()).To8BitData());
+	SIF_LOG("dmaSIF0 %s", sif0ch.cmqt_to_str().c_str());
 
 	if (sif0.fifo.readPos != sif0.fifo.writePos)
 	{
@@ -350,17 +353,18 @@ __fi void dmaSIF0()
 	psHu32(SBUS_F240) |= 0x2000;
 	sif0.ee.busy = true;
 
-	// Okay, this here is needed currently (r3644). 
+	// Okay, this here is needed currently (r3644).
 	// FFX battles in the thunder plains map die otherwise, Phantasy Star 4 as well
 	// These 2 games could be made playable again by increasing the time the EE or the IOP run,
 	// showing that this is very timing sensible.
 	// Doing this DMA unfortunately brings back an old warning in Legend of Legaia though, but it still works.
 
-	//Updated 23/08/2011: The hangs are caused by the EE suspending SIF1 DMA and restarting it when in the middle 
+	//Updated 23/08/2011: The hangs are caused by the EE suspending SIF1 DMA and restarting it when in the middle
 	//of processing a "REFE" tag, so the hangs can be solved by forcing the ee.end to be false
 	// (as it should always be at the beginning of a DMA).  using "if iop is busy" flags breaks Tom Clancy Rainbow Six.
 	// Legend of Legaia doesn't throw a warning either :)
 	sif0.ee.end = false;
+	CPU_SET_DMASTALL(DMAC_SIF0, false);
 	SIF0Dma();
 
 }

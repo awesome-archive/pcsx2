@@ -1,22 +1,12 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
 #pragma once
 
 #include "MemoryTypes.h"
 #include "R5900.h"
+
+#include "common/StringUtil.h"
 
 enum vif0_stat_flags
 {
@@ -112,13 +102,13 @@ union tVIF_STAT {
 	};
 	u32 _u32;
 
-	tVIF_STAT() {}
+	tVIF_STAT() = default;
 	tVIF_STAT(u32 val)			{ _u32 = val; }
 	bool test(u32 flags) const	{ return !!(_u32 & flags); }
 	void set_flags	(u32 flags)	{ _u32 |=  flags; }
 	void clear_flags(u32 flags) { _u32 &= ~flags; }
 	void reset()				{ _u32 = 0; }
-	wxString desc() const		{ return wxsFormat(L"Stat: 0x%x", _u32); }
+	std::string desc() const		{ return StringUtil::StdStringFromFormat("Stat: 0x%x", _u32); }
 };
 
 #define VIF_STAT(value) ((tVIF_STAT)(value))
@@ -133,12 +123,13 @@ union tVIF_FBRST {
 	};
 	u32 _u32;
 
+	tVIF_FBRST() = default;
 	tVIF_FBRST(u32 val)					{ _u32 = val; }
 	bool test		(u32 flags) const	{ return !!(_u32 & flags); }
 	void set_flags	(u32 flags)			{ _u32 |=  flags; }
 	void clear_flags(u32 flags)			{ _u32 &= ~flags; }
 	void reset()						{ _u32 = 0; }
-	wxString desc() const				{ return wxsFormat(L"Fbrst: 0x%x", _u32); }
+	std::string desc() const				{ return StringUtil::StdStringFromFormat("Fbrst: 0x%x", _u32); }
 };
 
 #define FBRST(value) ((tVIF_FBRST)(value))
@@ -152,14 +143,14 @@ union tVIF_ERR {
 	};
 	u32 _u32;
 
-	tVIF_ERR() {}
+	tVIF_ERR() = default;
 	tVIF_ERR  (u32 val)					{ _u32 = val; }
 	void write(u32 val)					{ _u32 = val; }
 	bool test		(u32 flags) const	{ return !!(_u32 & flags); }
 	void set_flags	(u32 flags)			{ _u32 |=  flags; }
 	void clear_flags(u32 flags)			{ _u32 &= ~flags; }
 	void reset()						{ _u32 = 0; }
-	wxString desc() const				{ return wxsFormat(L"Err: 0x%x", _u32); }
+	std::string desc() const				{ return StringUtil::StdStringFromFormat("Err: 0x%x", _u32); }
 };
 
 struct vifCycle

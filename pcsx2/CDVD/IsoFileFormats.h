@@ -1,25 +1,16 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
 #pragma once
 
-#include "CDVD.h"
-#include "wx/wfstream.h"
-#include "AsyncFileReader.h"
-#include "CompressedFileReader.h"
+#include "CDVD/CDVD.h"
+#include "CDVD/ThreadedFileReader.h"
 #include <memory>
+#include <string>
+#include <vector>
+
+class Error;
+class ProgressCallback;
 
 enum isoType
 {
@@ -30,121 +21,115 @@ enum isoType
 	ISOTYPE_DVDDL
 };
 
-static const int CD_FRAMESIZE_RAW	= 2448;
+static constexpr int CD_FRAMESIZE_RAW = 2448;
 
 // --------------------------------------------------------------------------------------
 //  isoFile
 // --------------------------------------------------------------------------------------
-class InputIsoFile
+class InputIsoFile final
 {
-	DeclareNoncopyableObject( InputIsoFile );
-	
-	 static const uint MaxReadUnit = 128;
+	DeclareNoncopyableObject(InputIsoFile);
 
 protected:
-	 uint ReadUnit;
+	std::string m_filename;
+	std::unique_ptr<ThreadedFileReader> m_reader;
 
-protected:
-	wxString	m_filename;
-	AsyncFileReader*	m_reader;
+	u32 m_current_lsn;
 
-	s32 		m_current_lsn;
+	isoType m_type;
+	u32 m_flags;
 
-	isoType		m_type;
-	u32			m_flags;
-
-	s32			m_offset;
-	s32			m_blockofs;
-	u32			m_blocksize;
+	s32 m_offset;
+	s32 m_blockofs;
+	u32 m_blocksize;
 
 	// total number of blocks in the ISO image (including all parts)
-	u32			m_blocks;
-		
-	bool		m_read_inprogress;
-	uint		m_read_lsn;
-	uint		m_read_count;
-	u8			m_readbuffer[MaxReadUnit * CD_FRAMESIZE_RAW];
-	
-public:	
+	u32 m_blocks;
+
+	bool m_read_inprogress;
+	uint m_read_lsn;
+	u8 m_readbuffer[CD_FRAMESIZE_RAW];
+
+public:
 	InputIsoFile();
-	virtual ~InputIsoFile();
+	~InputIsoFile();
 
 	bool IsOpened() const;
-	
-	isoType GetType() const		{ return m_type; }
-	uint GetBlockCount() const	{ return m_blocks; }	
-	int GetBlockOffset() const	{ return m_blockofs; }
-	
-	const wxString& GetFilename() const
+
+	isoType GetType() const noexcept { return m_type; }
+	uint GetBlockCount() const noexcept { return m_blocks; }
+	int GetBlockOffset() const  noexcept { return m_blockofs; }
+
+	const std::string& GetFilename() const
 	{
 		return m_filename;
 	}
 
-	bool Test( const wxString& srcfile );
-	bool Open( const wxString& srcfile, bool testOnly = false );
+	bool Open(std::string srcfile, Error* error);
+	bool Precache(ProgressCallback* progress, Error* error);
 	void Close();
-	bool Detect( bool readType=true );
+	bool Detect(bool readType = true);
 
 	int ReadSync(u8* dst, uint lsn);
 
 	void BeginRead2(uint lsn);
 	int FinishRead3(u8* dest, uint mode);
-	
+
 protected:
 	void _init();
 
-	bool tryIsoType(u32 _size, s32 _offset, s32 _blockofs);
+	bool tryIsoType(u32 size, u32 offset, u32 blockofs);
 	void FindParts();
 };
 
-class OutputIsoFile
+class OutputIsoFile final
 {
-	DeclareNoncopyableObject( OutputIsoFile );
-	
+	DeclareNoncopyableObject(OutputIsoFile);
+
 protected:
-	wxString	m_filename;
+	std::string m_filename;
 
-	u32			m_version;
+	u32 m_version;
 
-	s32			m_offset;
-	s32			m_blockofs;
-	u32			m_blocksize;
+	s32 m_offset;
+	s32 m_blockofs;
+	u32 m_blocksize;
 
 	// total number of blocks in the ISO image (including all parts)
-	u32			m_blocks;
+	u32 m_blocks;
 
 	// dtable is used when reading blockdumps
 	std::vector<u32> m_dtable;
 
-	std::unique_ptr<wxFileOutputStream>	m_outstream;
-		
-public:	
+	std::FILE* m_outstream = nullptr;
+
+public:
 	OutputIsoFile();
-	virtual ~OutputIsoFile();
+	~OutputIsoFile();
 
 	bool IsOpened() const;
 	u32 GetBlockSize() const;
-	
-	const wxString& GetFilename() const
+
+	const std::string& GetFilename() const noexcept
 	{
 		return m_filename;
 	}
 
-	void Create(const wxString& filename, int mode);
+	bool Create(std::string filename, int mode);
 	void Close();
 
 	void WriteHeader(int blockofs, uint blocksize, uint blocks);
 
 	void WriteSector(const u8* src, uint lsn);
-	
+
 protected:
 	void _init();
 
-	void WriteBuffer( const void* src, size_t size );
+	void WriteBuffer(const void* src, size_t size);
 
-	template< typename T >
-	void WriteValue( const T& data )
+	template <typename T>
+	void WriteValue(const T& data)
 	{
-		WriteBuffer( &data, sizeof(data) );
+		WriteBuffer(&data, sizeof(data));
 	}
 };

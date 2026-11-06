@@ -1,51 +1,38 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
-#ifndef PCSX2_PRECOMPILED_HEADER
-#define PCSX2_PRECOMPILED_HEADER
+#pragma once
 
 // Disable some pointless warnings...
 #ifdef _MSC_VER
 #	pragma warning(disable:4250) //'class' inherits 'method' via dominance
-#	pragma warning(disable:4996) //ignore the stricmp deprecated warning
 #endif
 
-#include "Utilities/Dependencies.h"
-
-#define NOMINMAX		// Disables other libs inclusion of their own min/max macros (we use std instead)
-
-//////////////////////////////////////////////////////////////////////////////////////////
-// Welcome wxWidgets to the party!
-
-#include <wx/string.h>
-#include <wx/tokenzr.h>
-#include <wx/intl.h>
-#include <wx/log.h>
-#include <wx/filename.h>
+#include "common/Pcsx2Defs.h"
+#include "common/VectorIntrin.h"
 
 //////////////////////////////////////////////////////////////////////////////////////////
-// Include the STL junk that's actually handy.
+// Include the STL that's actually handy.
 
-#include <stdexcept>
-#include <vector>
-#include <list>
-#include <stack>
+#include <algorithm>
+#include <cinttypes>	// Printf format
+#include <condition_variable>
+#include <climits>
 #include <cstring>		// string.h under c++
 #include <cstdio>		// stdio.h under c++
 #include <cstdlib>
-#include <cinttypes>	// Printf format
+#include <cmath>
+#include <list>
+#include <memory>
+#include <mutex>
+#include <functional>
+#include <optional>
+#include <stack>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
 
 // ... and include some ANSI/POSIX C libs that are useful too, just for good measure.
 // (these compile lightning fast with or without PCH, but they never change so
@@ -53,52 +40,9 @@
 
 #include <stddef.h>
 #include <sys/stat.h>
-#include <pthread.h>
 
-
-// As plugins which use C have to be used with PCSX2, the BOOL type is redefined
-// to prevent any C/C++ compatibility issues.
-typedef int BOOL;
-#undef  TRUE
-#undef  FALSE
-#define TRUE  1
-#define FALSE 0
-
-
-//////////////////////////////////////////////////////////////////////////////////////////
-// Begin Pcsx2 Includes: Add items here that are local to Pcsx2 but stay relatively
-// unchanged for long periods of time, or happen to be used by almost everything, so they
-// need a full recompile anyway, when modified (etc)
-
-#include "Pcsx2Defs.h"
-#include "i18n.h"
-
-#include "Utilities/FixedPointTypes.h"
-#include "Utilities/wxBaseTools.h"
-#include "Utilities/Path.h"
-#include "Utilities/Console.h"
-#include "Utilities/MemcpyFast.h"
-#include "Utilities/General.h"
-#include "x86emitter/tools.h"
-
-#include "Config.h"
-
-typedef void FnType_Void();
-typedef FnType_Void* Fnptr_Void;
-
-// --------------------------------------------------------------------------------------
-//  Compiler/OS specific macros and defines 
-// --------------------------------------------------------------------------------------
-
-#if defined(_MSC_VER)
-
-#	define strnicmp _strnicmp
-#	define stricmp _stricmp
-
-#else	// must be GCC or Clang
-
-#include <sys/types.h>
-
-#endif
-
+// We use fmt a fair bit now.
+// fmt pch breaks GCC in debug builds: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=114370
+#if !defined(__GNUC__) || defined(__clang__)
+#include "fmt/format.h"
 #endif

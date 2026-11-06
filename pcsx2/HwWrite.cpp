@@ -1,29 +1,23 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
-
-#include "PrecompiledHeader.h"
 #include "Common.h"
 #include "Hardware.h"
 #include "Gif_Unit.h"
-#include "IopCommon.h"
+#include "IopHw.h"
+#include "IopMem.h"
+
 #include "ps2/HwInternal.h"
 #include "ps2/eeHwTraceLog.inl"
 
 #include "ps2/pgif.h"
+#include "SPU2/spu2.h"
 #include "R3000A.h"
+
+#include "CDVD/Ps1CD.h"
+#include "CDVD/CDVD.h"
+
+#include "IopDma.h" // for iopIntcIrq
 
 using namespace R5900;
 
@@ -33,13 +27,13 @@ using namespace R5900;
 #define HELPSWITCH(m) (((m)>>4) & 0xff)
 #define mcase(src) case HELPSWITCH(src)
 
-template< uint page > void __fastcall _hwWrite8(u32 mem, u8 value);
-template< uint page > void __fastcall _hwWrite16(u32 mem, u8 value);
-template< uint page > void __fastcall _hwWrite128(u32 mem, u8 value);
+template< uint page > void _hwWrite8(u32 mem, u8 value);
+template< uint page > void _hwWrite16(u32 mem, u8 value);
+template< uint page > void TAKES_R128 _hwWrite128(u32 mem, r128 value);
 
 
 template<uint page>
-void __fastcall _hwWrite32( u32 mem, u32 value )
+void _hwWrite32( u32 mem, u32 value )
 {
 	pxAssume( (mem & 0x03) == 0 );
 
@@ -75,8 +69,7 @@ void __fastcall _hwWrite32( u32 mem, u32 value )
 			u128 zerofill = u128::From32(0);
 			zerofill._u32[(mem >> 2) & 0x03] = value;
 
-			DevCon.WriteLn( Color_Cyan, "Writing 32-bit FIFO data (zero-extended to 128 bits)" );
-			_hwWrite128<page>(mem & ~0x0f, &zerofill);
+			_hwWrite128<page>(mem & ~0x0f, r128_from_u128(zerofill));
 		}
 		return;
 
@@ -92,9 +85,9 @@ void __fastcall _hwWrite32( u32 mem, u32 value )
 					if (!vifWrite32<0>(mem, value)) return;
 				}
 			}
-			else iswitch(mem)
+			else switch(mem)
 			{
-				icase(GIF_CTRL)
+				case (GIF_CTRL):
 				{
 					// Not exactly sure what RST needs to do
 					gifRegs.ctrl.write(value & 9);
@@ -107,17 +100,16 @@ void __fastcall _hwWrite32( u32 mem, u32 value )
 					return;
 				}
 
-				icase(GIF_MODE)
+				case (GIF_MODE):
 				{
 					gifRegs.mode.write(value);
-
 					//Need to kickstart the GIF if the M3R mask comes off
-					if (gifRegs.stat.M3R == 1 && gifRegs.mode.M3R == 0 && gifch.chcr.STR)
+					if (gifRegs.stat.M3R == 1 && gifRegs.mode.M3R == 0 && (gifch.chcr.STR || gif_fifo.fifoSize))
 					{
 						DevCon.Warning("GIF Mode cancelling P3 Disable");
 						CPU_INT(DMAC_GIF, 8);
 					}
-						
+
 
 					gifRegs.stat.M3R = gifRegs.mode.M3R;
 					gifRegs.stat.IMT = gifRegs.mode.IMT;
@@ -176,16 +168,23 @@ void __fastcall _hwWrite32( u32 mem, u32 value )
 					psHu32(mem) &= ~value;
 				return;
 
-				mcase(SBUS_F240) :
-					//if (value & (1 << 19)) // switch hardware into psx mode. Doesn't work for some reason, still needs this to be in cdvdWrite14?
-					//{
-					//	u32 cycle = psxRegs.cycle;
-					//	//pgifInit();
-					//	psxHwReset();
-					//	psxHu32(0x1f801450) = 0x8;
-					//	psxHu32(0x1f801078) = 1;
-					//	psxRegs.cycle = cycle;
-					//}
+				mcase(SBUS_F240):
+					if (value & (1 << 18))
+					{
+						iopIntcIrq(1);
+					}
+					if (value & (1 << 19))
+					{
+						u64 cycle = psxRegs.cycle;
+						//pgifInit();
+						psxReset();
+						PSXCLK =  33868800;
+						SPU2::Reset(true);
+						setPs1CDVDSpeed(cdvd.Speed);
+						psxHu32(HW_ICFG) = 0x8;
+						psxHu32(HW_ICTRL) = 1;
+						psxRegs.cycle = cycle;
+					}
 					if(!(value & 0x100))
 						psHu32(mem) &= ~0x100;
 					else
@@ -249,6 +248,8 @@ void __fastcall _hwWrite32( u32 mem, u32 value )
 				default:
 					// TODO: psx add the real address in a sbus mcase
 					if (((mem & 0x1FFFFFFF) >= EEMemoryMap::SBUS_PS1_Start) && ((mem & 0x1FFFFFFF) < EEMemoryMap::SBUS_PS1_End)) {
+						// Tharr be console spam here! Need to figure out how to print what mode
+						//pgifConLog(L"Pgif DMA: set mode");.
 						PGIFw((mem & 0x1FFFFFFF), value);
 						return;
 					}
@@ -267,7 +268,7 @@ void __fastcall _hwWrite32( u32 mem, u32 value )
 }
 
 template<uint page>
-void __fastcall hwWrite32( u32 mem, u32 value )
+void hwWrite32( u32 mem, u32 value )
 {
 	eeHwTraceLog( mem, value, false );
 	_hwWrite32<page>( mem, value );
@@ -278,34 +279,42 @@ void __fastcall hwWrite32( u32 mem, u32 value )
 // --------------------------------------------------------------------------------------
 
 template< uint page >
-void __fastcall _hwWrite8(u32 mem, u8 value)
+void _hwWrite8(u32 mem, u8 value)
 {
 #if PSX_EXTRALOGS
 	if ((mem & 0x1000ff00) == 0x1000f300) DevCon.Warning("8bit Write to SIF Register %x value %x wibble", mem, value);
 #endif
-	iswitch (mem)
-	icase(SIO_TXFIFO)
+	if (mem == SIO_TXFIFO)
 	{
-		static bool iggy_newline = false;
-		static char sio_buffer[1024];
-		static int sio_count;
-
-		if (value == '\r')
+		static bool last_char_was_cr = false;
+		
+		// skip the \n in \r\n
+		if(last_char_was_cr && (value == '\n'))
 		{
-			iggy_newline = true;
-			sio_buffer[sio_count++] = '\n';
+			last_char_was_cr = false;
+			return;
 		}
-		else if (!iggy_newline || (value != '\n'))
+		
+		last_char_was_cr = value == '\r';
+		bool should_flush_cause_newline = false;
+		if (last_char_was_cr)
 		{
-			iggy_newline = false;
-			sio_buffer[sio_count++] = value;
+			should_flush_cause_newline = true;
+			ee_sio_tx_fifo.push_back('\n');
+		}
+		else
+		{
+			should_flush_cause_newline = value == '\n';
+			ee_sio_tx_fifo.push_back(value);
 		}
 
-		if ((sio_count == ArraySize(sio_buffer)-1) || (sio_count != 0 && sio_buffer[sio_count-1] == '\n'))
+		// Check if the only thing in the buffer
+		if (ee_sio_tx_fifo.size() == 1024 || should_flush_cause_newline)
 		{
-			sio_buffer[sio_count] = 0;
-			eeConLog( ShiftJIS_ConvertString(sio_buffer) );
-			sio_count = 0;
+			std::string output_string(ee_sio_tx_fifo.begin(), ee_sio_tx_fifo.end());
+
+			eeConLog(ShiftJIS_ConvertString(output_string.c_str()));
+			ee_sio_tx_fifo.clear();
 		}
 		return;
 	}
@@ -328,14 +337,14 @@ void __fastcall _hwWrite8(u32 mem, u8 value)
 }
 
 template< uint page >
-void __fastcall hwWrite8(u32 mem, u8 value)
+void hwWrite8(u32 mem, u8 value)
 {
 	eeHwTraceLog( mem, value, false );
 	_hwWrite8<page>(mem, value);
 }
 
 template< uint page >
-void __fastcall _hwWrite16(u32 mem, u16 value)
+void _hwWrite16(u32 mem, u16 value)
 {
 	pxAssume( (mem & 0x01) == 0 );
 #if PSX_EXTRALOGS
@@ -359,14 +368,14 @@ void __fastcall _hwWrite16(u32 mem, u16 value)
 }
 
 template< uint page >
-void __fastcall hwWrite16(u32 mem, u16 value)
+void hwWrite16(u32 mem, u16 value)
 {
 	eeHwTraceLog( mem, value, false );
 	_hwWrite16<page>(mem, value);
 }
 
 template<uint page>
-void __fastcall _hwWrite64( u32 mem, const mem64_t* srcval )
+void _hwWrite64( u32 mem, u64 value )
 {
 	pxAssume( (mem & 0x07) == 0 );
 
@@ -380,7 +389,7 @@ void __fastcall _hwWrite64( u32 mem, const mem64_t* srcval )
 	switch (page)
 	{
 		case 0x02:
-			if (!ipuWrite64(mem, *srcval)) return;
+			if (!ipuWrite64(mem, value)) return;
 		break;
 
 		case 0x04:
@@ -388,33 +397,31 @@ void __fastcall _hwWrite64( u32 mem, const mem64_t* srcval )
 		case 0x06:
 		case 0x07:
 		{
-			DevCon.WriteLn( Color_Cyan, "Writing 64-bit FIFO data (zero-extended to 128 bits)" );
-
 			u128 zerofill = u128::From32(0);
-			zerofill._u64[(mem >> 3) & 0x01] = *srcval;
-			hwWrite128<page>(mem & ~0x0f, &zerofill);
+			zerofill._u64[(mem >> 3) & 0x01] = value;
+			hwWrite128<page>(mem & ~0x0f, r128_from_u128(zerofill));
 		}
 		return;
-		
+
 		default:
 			// disregard everything except the lower 32 bits.
 			// ... and skip the 64 bit writeback since the 32-bit one will suffice.
-			hwWrite32<page>( mem, ((u32*)srcval)[0] );
+			hwWrite32<page>( mem, value );
 		return;
 	}
 
-	psHu64(mem) = *srcval;
+	std::memcpy(&eeHw[(mem) & 0xffff], &value, sizeof(value));
 }
 
 template<uint page>
-void __fastcall hwWrite64( u32 mem, const mem64_t* srcval )
+void hwWrite64( u32 mem, mem64_t value )
 {
-	eeHwTraceLog( mem, *srcval, false );
-	_hwWrite64<page>(mem, srcval);
+	eeHwTraceLog( mem, value, false );
+	_hwWrite64<page>(mem, value);
 }
 
 template< uint page >
-void __fastcall _hwWrite128(u32 mem, const mem128_t* srcval)
+void TAKES_R128 _hwWrite128(u32 mem, r128 srcval)
 {
 	pxAssume( (mem & 0x0f) == 0 );
 
@@ -424,24 +431,35 @@ void __fastcall _hwWrite128(u32 mem, const mem128_t* srcval)
 #if PSX_EXTRALOGS
 	if ((mem & 0x1000ff00) == 0x1000f300) DevCon.Warning("128bit Write to SIF Register %x wibble", mem);
 #endif
+
 	switch (page)
 	{
 		case 0x04:
-			WriteFIFO_VIF0(srcval);
+			{
+				alignas(16) const u128 usrcval = r128_to_u128(srcval);
+				WriteFIFO_VIF0(&usrcval);
+			}
 		return;
 
 		case 0x05:
-			WriteFIFO_VIF1(srcval);
+			{
+				alignas(16) const u128 usrcval = r128_to_u128(srcval);
+				WriteFIFO_VIF1(&usrcval);
+			}
 		return;
 
 		case 0x06:
-			WriteFIFO_GIF(srcval);
+			{
+				alignas(16) const u128 usrcval = r128_to_u128(srcval);
+				WriteFIFO_GIF(&usrcval);
+			}
 		return;
 
 		case 0x07:
 			if (mem & 0x10)
 			{
-				WriteFIFO_IPUin(srcval);
+				alignas(16) const u128 usrcval = r128_to_u128(srcval);
+				WriteFIFO_IPUin(&usrcval);
 			}
 			else
 			{
@@ -457,7 +475,8 @@ void __fastcall _hwWrite128(u32 mem, const mem128_t* srcval)
 		case 0x0F:
 			// todo: psx mode: this is new
 			if (((mem & 0x1FFFFFFF) >= EEMemoryMap::SBUS_PS1_Start) && ((mem & 0x1FFFFFFF) < EEMemoryMap::SBUS_PS1_End)) {
-				PGIFwQword((mem & 0x1FFFFFFF), (void*)srcval);
+				alignas(16) const u128 usrcval = r128_to_u128(srcval);
+				PGIFwQword((mem & 0x1FFFFFFF), (void*)&usrcval);
 				return;
 			}
 
@@ -465,24 +484,24 @@ void __fastcall _hwWrite128(u32 mem, const mem128_t* srcval)
 	}
 
 	// All upper bits of all non-FIFO 128-bit HW writes are almost certainly disregarded. --air
-	hwWrite64<page>(mem, (mem64_t*)srcval);
+	hwWrite64<page>(mem, r128_to_u64(srcval));
 
 	//CopyQWC(&psHu128(mem), srcval);
 }
 
 template< uint page >
-void __fastcall hwWrite128(u32 mem, const mem128_t* srcval)
+void TAKES_R128 hwWrite128(u32 mem, r128 srcval)
 {
-	eeHwTraceLog( mem, *srcval, false );
+	eeHwTraceLog( mem, srcval, false );
 	_hwWrite128<page>(mem, srcval);
 }
 
 #define InstantizeHwWrite(pageidx) \
-	template void __fastcall hwWrite8<pageidx>(u32 mem, mem8_t value); \
-	template void __fastcall hwWrite16<pageidx>(u32 mem, mem16_t value); \
-	template void __fastcall hwWrite32<pageidx>(u32 mem, mem32_t value); \
-	template void __fastcall hwWrite64<pageidx>(u32 mem, const mem64_t* srcval); \
-	template void __fastcall hwWrite128<pageidx>(u32 mem, const mem128_t* srcval);
+	template void hwWrite8<pageidx>(u32 mem, mem8_t value); \
+	template void hwWrite16<pageidx>(u32 mem, mem16_t value); \
+	template void hwWrite32<pageidx>(u32 mem, mem32_t value); \
+	template void hwWrite64<pageidx>(u32 mem, mem64_t value); \
+	template void TAKES_R128 hwWrite128<pageidx>(u32 mem, r128 srcval);
 
 InstantizeHwWrite(0x00);	InstantizeHwWrite(0x08);
 InstantizeHwWrite(0x01);	InstantizeHwWrite(0x09);

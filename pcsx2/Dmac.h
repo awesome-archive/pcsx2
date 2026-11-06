@@ -1,19 +1,10 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
 #pragma once
+
+#include "common/Assertions.h"
+#include "common/StringUtil.h"
 
 // Useful enums for some of the fields.
 enum pce_values
@@ -92,24 +83,24 @@ union tDMA_TAG {
 	};
 	u32 _u32;
 
-	tDMA_TAG() {}
+	tDMA_TAG() = default;
 
 	tDMA_TAG(u32 val) { _u32 = val; }
 	u16 upper() const { return (_u32 >> 16); }
 	u16 lower() const { return (u16)_u32; }
-	wxString tag_to_str() const
+	std::string tag_to_str() const
 	{
 		switch(ID)
 		{
-			case TAG_REFE: return wxsFormat(L"REFE %08X", _u32); break;
-			case TAG_CNT: return L"CNT"; break;
-			case TAG_NEXT: return wxsFormat(L"NEXT %08X", _u32); break;
-			case TAG_REF: return wxsFormat(L"REF %08X", _u32); break;
-			case TAG_REFS: return wxsFormat(L"REFS %08X", _u32); break;
-			case TAG_CALL: return L"CALL"; break;
-			case TAG_RET: return L"RET"; break;
-			case TAG_END: return L"END"; break;
-			default: return L"????"; break;
+			case TAG_REFE: return StringUtil::StdStringFromFormat("REFE %08X", _u32);
+			case TAG_CNT: return "CNT";
+			case TAG_NEXT: return StringUtil::StdStringFromFormat("NEXT %08X", _u32);
+			case TAG_REF: return StringUtil::StdStringFromFormat("REF %08X", _u32);
+			case TAG_REFS: return StringUtil::StdStringFromFormat("REFS %08X", _u32);
+			case TAG_CALL: return "CALL";
+			case TAG_RET: return "RET";
+			case TAG_END: return "END";
+			default: return "????";
 		}
 	}
 	void reset() { _u32 = 0; }
@@ -130,6 +121,7 @@ union tDMA_CHCR {
 	};
 	u32 _u32;
 
+	tDMA_CHCR() = default;
 	tDMA_CHCR( u32 val) { _u32 = val; }
 
 	bool test(u32 flags) const { return !!(_u32 & flags); }
@@ -139,7 +131,7 @@ union tDMA_CHCR {
 	void reset() { _u32 = 0; }
 	u16 upper() const { return (_u32 >> 16); }
 	u16 lower() const { return (u16)_u32; }
-	wxString desc() const { return wxsFormat(L"Chcr: 0x%x", _u32); }
+	std::string desc() const { return StringUtil::StdStringFromFormat("Chcr: 0x%x", _u32); }
 	tDMA_TAG tag() { return (tDMA_TAG)_u32; }
 };
 
@@ -152,24 +144,25 @@ union tDMA_SADR {
 	};
 	u32 _u32;
 
+	tDMA_SADR() = default;
 	tDMA_SADR(u32 val) { _u32 = val; }
 
 	void reset() { _u32 = 0; }
-	wxString desc() const { return wxsFormat(L"Sadr: 0x%x", _u32); }
+	std::string desc() const { return StringUtil::StdStringFromFormat("Sadr: 0x%x", _u32); }
 	tDMA_TAG tag() const { return (tDMA_TAG)_u32; }
 };
 
 union tDMA_QWC {
 	struct {
-		u16 QWC;
-		u16 _unused;
+		u32 QWC;
 	};
 	u32 _u32;
 
+	tDMA_QWC() = default;
 	tDMA_QWC(u32 val) { _u32 = val; }
 
 	void reset() { _u32 = 0; }
-	wxString desc() const { return wxsFormat(L"QWC: 0x%04x", QWC); }
+	std::string desc() const { return StringUtil::StdStringFromFormat("QWC: 0x%04x", QWC); }
 	tDMA_TAG tag() const { return (tDMA_TAG)_u32; }
 };
 
@@ -178,7 +171,7 @@ struct DMACh {
 	u32 _null0[3];
 	u32 madr;
 	u32 _null1[3];
-	u16 qwc; u16 pad;
+	u32 qwc;
 	u32 _null2[3];
 	u32 tadr;
 	u32 _null3[3];
@@ -204,8 +197,8 @@ struct DMACh {
 	tDMA_TAG *DMAtransfer(u32 addr, u32 num);
 	tDMA_TAG dma_tag();
 
-	wxString cmq_to_str() const;
-	wxString cmqt_to_str() const;
+	std::string cmq_to_str() const;
+	std::string cmqt_to_str() const;
 };
 
 enum INTCIrqs
@@ -274,26 +267,27 @@ union tDMAC_QUEUE
 	};
 	u16 _u16;
 
+	tDMAC_QUEUE() = default;
 	tDMAC_QUEUE(u16 val) { _u16 = val; }
 	void reset() { _u16 = 0; }
 	bool empty() const { return (_u16 == 0); }
 };
 
-static __fi const wxChar* ChcrName(u32 addr)
+static __fi const char* ChcrName(u32 addr)
 {
     switch (addr)
     {
-        case D0_CHCR: return L"Vif 0";
-        case D1_CHCR: return L"Vif 1";
-        case D2_CHCR: return L"GIF";
-        case D3_CHCR: return L"Ipu 0";
-        case D4_CHCR: return L"Ipu 1";
-        case D5_CHCR: return L"Sif 0";
-        case D6_CHCR: return L"Sif 1";
-        case D7_CHCR: return L"Sif 2";
-        case D8_CHCR: return L"SPR 0";
-        case D9_CHCR: return L"SPR 1";
-        default: return L"???";
+        case D0_CHCR: return "Vif 0";
+        case D1_CHCR: return "Vif 1";
+        case D2_CHCR: return "GIF";
+        case D3_CHCR: return "Ipu 0";
+        case D4_CHCR: return "Ipu 1";
+        case D5_CHCR: return "Sif 0";
+        case D6_CHCR: return "Sif 1";
+        case D7_CHCR: return "Sif 2";
+        case D8_CHCR: return "SPR 0";
+        case D9_CHCR: return "SPR 1";
+        default: return "???";
     }
 }
 
@@ -314,7 +308,7 @@ static __fi int ChannelNumber(u32 addr)
         case D9_CHCR: return 9;
 		default:
 		{
-			pxFailDev("Invalid DMA channel number");
+			pxFail("Invalid DMA channel number");
 			return 51; // some value
 		}
     }
@@ -332,13 +326,15 @@ union tDMAC_CTRL {
 	};
 	u32 _u32;
 
+	tDMAC_CTRL() = default;
 	tDMAC_CTRL(u32 val) { _u32 = val; }
 
 	bool test(u32 flags) const { return !!(_u32 & flags); }
+	bool is_mfifo(bool is_vif) const { return (is_vif) ? (MFD == MFD_VIF1) : (MFD == MFD_GIF); }
 	void set_flags(u32 flags) { _u32 |= flags; }
 	void clear_flags(u32 flags) { _u32 &= ~flags; }
 	void reset() { _u32 = 0; }
-	wxString desc() const { return wxsFormat(L"Ctrl: 0x%x", _u32); }
+	std::string desc() const { return StringUtil::StdStringFromFormat("Ctrl: 0x%x", _u32); }
 };
 
 union tDMAC_STAT {
@@ -357,13 +353,14 @@ union tDMAC_STAT {
 	u32 _u32;
 	u16 _u16[2];
 
+	tDMAC_STAT() = default;
 	tDMAC_STAT(u32 val) { _u32 = val; }
 
 	bool test(u32 flags) const { return !!(_u32 & flags); }
 	void set_flags(u32 flags) { _u32 |= flags; }
 	void clear_flags(u32 flags) { _u32 &= ~flags; }
 	void reset() { _u32 = 0; }
-	wxString desc() const { return wxsFormat(L"Stat: 0x%x", _u32); }
+	std::string desc() const { return StringUtil::StdStringFromFormat("Stat: 0x%x", _u32); }
 
 	bool TestForInterrupt() const
 	{
@@ -381,13 +378,14 @@ union tDMAC_PCR {
 	};
 	u32 _u32;
 
+	tDMAC_PCR() = default;
 	tDMAC_PCR(u32 val) { _u32 = val; }
 
 	bool test(u32 flags) const { return !!(_u32 & flags); }
 	void set_flags(u32 flags) { _u32 |= flags; }
 	void clear_flags(u32 flags) { _u32 &= ~flags; }
 	void reset() { _u32 = 0; }
-	wxString desc() const { return wxsFormat(L"Pcr: 0x%x", _u32); }
+	std::string desc() const { return StringUtil::StdStringFromFormat("Pcr: 0x%x", _u32); }
 };
 
 union tDMAC_SQWC {
@@ -399,13 +397,14 @@ union tDMAC_SQWC {
 	};
 	u32 _u32;
 
+	tDMAC_SQWC() = default;
 	tDMAC_SQWC(u32 val) { _u32 = val; }
 
 	bool test(u32 flags) const { return !!(_u32 & flags); }
 	void set_flags(u32 flags) { _u32 |= flags; }
 	void clear_flags(u32 flags) { _u32 &= ~flags; }
 	void reset() { _u32 = 0; }
-	wxString desc() const { return wxsFormat(L"Sqwc: 0x%x", _u32); }
+	std::string desc() const { return StringUtil::StdStringFromFormat("Sqwc: 0x%x", _u32); }
 };
 
 union tDMAC_RBSR {
@@ -415,10 +414,11 @@ union tDMAC_RBSR {
 	};
 	u32 _u32;
 
+	tDMAC_RBSR() = default;
 	tDMAC_RBSR(u32 val) { _u32 = val; }
 
 	void reset() { _u32 = 0; }
-	wxString desc() const { return wxsFormat(L"Rbsr: 0x%x", _u32); }
+	std::string desc() const { return StringUtil::StdStringFromFormat("Rbsr: 0x%x", _u32); }
 };
 
 union tDMAC_RBOR {
@@ -428,10 +428,11 @@ union tDMAC_RBOR {
 	};
 	u32 _u32;
 
+	tDMAC_RBOR() = default;
 	tDMAC_RBOR(u32 val) { _u32 = val; }
 
 	void reset() { _u32 = 0; }
-	wxString desc() const { return wxsFormat(L"Rbor: 0x%x", _u32); }
+	std::string desc() const { return StringUtil::StdStringFromFormat("Rbor: 0x%x", _u32); }
 };
 
 // --------------------------------------------------------------------------------------
@@ -449,7 +450,7 @@ union tDMAC_ADDR
 	};
 	u32 _u32;
 
-	tDMAC_ADDR() {}
+	tDMAC_ADDR() = default;
 	tDMAC_ADDR(u32 val) { _u32 = val; }
 
 	void clear() { _u32 = 0; }
@@ -466,14 +467,9 @@ union tDMAC_ADDR
 		if (SPR) ADDR &= (Ps2MemSize::Scratch-1);
 	}
 
-	wxString ToString(bool sprIsValid=true) const
+	std::string ToString(bool sprIsValid=true) const
 	{
-		return pxsFmt((sprIsValid && SPR) ? L"0x%04X(SPR)" : L"0x%08X", ADDR);
-	}
-
-	wxCharBuffer ToUTF8(bool sprIsValid=true) const
-	{
-		return FastFormatAscii().Write((sprIsValid && SPR) ? "0x%04X(SPR)" : "0x%08X", ADDR).c_str();
+		return StringUtil::StdStringFromFormat((sprIsValid && SPR) ? "0x%04X(SPR)" : "0x%08X", ADDR);
 	}
 };
 
@@ -504,13 +500,14 @@ union tINTC_STAT {
 	};
 	u32 _u32;
 
+	tINTC_STAT() = default;
 	tINTC_STAT(u32 val) { _u32 = val; }
 
 	bool test(u32 flags) const { return !!(_u32 & flags); }
 	void set_flags(u32 flags) { _u32 |= flags; }
 	void clear_flags(u32 flags) { _u32 &= ~flags; }
 	void reset() { _u32 = 0; }
-	wxString desc() const { return wxsFormat(L"Stat: 0x%x", _u32); }
+	std::string desc() const { return StringUtil::StdStringFromFormat("Stat: 0x%x", _u32); }
 };
 
 union tINTC_MASK {
@@ -520,13 +517,14 @@ union tINTC_MASK {
 	};
 	u32 _u32;
 
+	tINTC_MASK() = default;
 	tINTC_MASK(u32 val) { _u32 = val; }
 
 	bool test(u32 flags) const { return !!(_u32 & flags); }
 	void set_flags(u32 flags) { _u32 |= flags; }
 	void clear_flags(u32 flags) { _u32 &= ~flags; }
 	void reset() { _u32 = 0; }
-	wxString desc() const { return wxsFormat(L"Mask: 0x%x", _u32); }
+	std::string desc() const { return StringUtil::StdStringFromFormat("Mask: 0x%x", _u32); }
 };
 
 struct INTCregisters
@@ -563,7 +561,7 @@ extern void hwDmacIrq(int n);
 
 extern void FireMFIFOEmpty();
 extern bool hwMFIFOWrite(u32 addr, const u128* data, uint size_qwc);
-extern void hwMFIFOResume(u32 transferred);
+extern void hwMFIFOResume();
 extern void hwDmacSrcTadrInc(DMACh& dma);
 extern bool hwDmacSrcChainWithStack(DMACh& dma, int id);
 extern bool hwDmacSrcChain(DMACh& dma, int id);

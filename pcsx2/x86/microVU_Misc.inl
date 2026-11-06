@@ -1,19 +1,9 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
 #pragma once
+#include <bitset>
+#include <optional>
 
 //------------------------------------------------------------------
 // Micro VU - Reg Loading/Saving/Shuffling/Unpacking/Merging...
@@ -21,7 +11,8 @@
 
 void mVUunpack_xyzw(const xmm& dstreg, const xmm& srcreg, int xyzw)
 {
-	switch ( xyzw ) {
+	switch (xyzw)
+	{
 		case 0: xPSHUF.D(dstreg, srcreg, 0x00); break; // XXXX
 		case 1: xPSHUF.D(dstreg, srcreg, 0x55); break; // YYYY
 		case 2: xPSHUF.D(dstreg, srcreg, 0xaa); break; // ZZZZ
@@ -31,114 +22,87 @@ void mVUunpack_xyzw(const xmm& dstreg, const xmm& srcreg, int xyzw)
 
 void mVUloadReg(const xmm& reg, xAddressVoid ptr, int xyzw)
 {
-	switch( xyzw ) {
-		case 8:		xMOVSSZX(reg, ptr32[ptr]);		break; // X
-		case 4:		xMOVSSZX(reg, ptr32[ptr+4]);	break; // Y
-		case 2:		xMOVSSZX(reg, ptr32[ptr+8]);	break; // Z
-		case 1:		xMOVSSZX(reg, ptr32[ptr+12]);	break; // W
-		default:	xMOVAPS (reg, ptr128[ptr]);		break;
+	switch (xyzw)
+	{
+		case 8:  xMOVSSZX(reg, ptr32[ptr     ]); break; // X
+		case 4:  xMOVSSZX(reg, ptr32[ptr +  4]); break; // Y
+		case 2:  xMOVSSZX(reg, ptr32[ptr +  8]); break; // Z
+		case 1:  xMOVSSZX(reg, ptr32[ptr + 12]); break; // W
+		default: xMOVAPS (reg, ptr128[ptr]);     break;
 	}
 }
 
 void mVUloadIreg(const xmm& reg, int xyzw, VURegs* vuRegs)
 {
 	xMOVSSZX(reg, ptr32[&vuRegs->VI[REG_I].UL]);
-	if (!_XYZWss(xyzw)) xSHUF.PS(reg, reg, 0);
+	if (!_XYZWss(xyzw))
+		xSHUF.PS(reg, reg, 0);
 }
 
 // Modifies the Source Reg!
 void mVUsaveReg(const xmm& reg, xAddressVoid ptr, int xyzw, bool modXYZW)
 {
-	/*xMOVAPS(xmmT2, ptr128[ptr]);
-	if (modXYZW && (xyzw == 8 || xyzw == 4 || xyzw == 2 || xyzw == 1)) {
-		mVUunpack_xyzw(reg, reg, 0);
-	}
-	mVUmergeRegs(xmmT2, reg, xyzw);
-
-	xMOVAPS(ptr128[ptr], xmmT2);
-	return;*/
-
-	switch ( xyzw ) {
-		case 5:		if (x86caps.hasStreamingSIMD4Extensions) {
-						xEXTRACTPS(ptr32[ptr+4], reg, 1);
-						xEXTRACTPS(ptr32[ptr+12], reg, 3);
-					}
-					else {
-						xPSHUF.D(reg, reg, 0xe1); //WZXY
-						xMOVSS(ptr32[ptr+4], reg);
-						xPSHUF.D(reg, reg, 0xff); //WWWW
-						xMOVSS(ptr32[ptr+12], reg);
-					}
-					break; // YW
-		case 6:		xPSHUF.D(reg, reg, 0xc9);
-					xMOVL.PS(ptr64[ptr+4], reg);
-					break; // YZ
-		case 7:		if (x86caps.hasStreamingSIMD4Extensions) {
-						xMOVH.PS(ptr64[ptr+8], reg);
-						xEXTRACTPS(ptr32[ptr+4],  reg, 1);
-					}
-					else {
-						xPSHUF.D(reg, reg, 0x93); //ZYXW
-						xMOVH.PS(ptr64[ptr+4], reg);
-						xMOVSS(ptr32[ptr+12], reg);
-					}
-					break; // YZW
-		case 9:		if (x86caps.hasStreamingSIMD4Extensions) {
-						xMOVSS(ptr32[ptr], reg);
-						xEXTRACTPS(ptr32[ptr+12], reg, 3);
-					}
-					else {
-						xMOVSS(ptr32[ptr], reg);
-						xPSHUF.D(reg, reg, 0xff); //WWWW
-						xMOVSS(ptr32[ptr+12], reg);
-					}
-					break; // XW
-		case 10:	if (x86caps.hasStreamingSIMD4Extensions) {
-						xMOVSS(ptr32[ptr], reg);
-						xEXTRACTPS(ptr32[ptr+8], reg, 2);
-					}
-					else {
-						xMOVSS(ptr32[ptr], reg);
-						xMOVHL.PS(reg, reg);
-						xMOVSS(ptr32[ptr+8], reg);
-					}
-					break; //XZ
-		case 11:	xMOVSS(ptr32[ptr], reg);
-					xMOVH.PS(ptr64[ptr+8], reg);
-					break; //XZW
-		case 13:	if (x86caps.hasStreamingSIMD4Extensions) {
-						xMOVL.PS(ptr64[ptr], reg);
-						xEXTRACTPS(ptr32[ptr+12], reg, 3);
-					}
-					else {
-						xPSHUF.D(reg, reg, 0x4b); //YXZW				
-						xMOVH.PS(ptr64[ptr], reg);
-						xMOVSS(ptr32[ptr+12], reg);
-					}
-					break; // XYW
-		case 14:	if (x86caps.hasStreamingSIMD4Extensions) {
-						xMOVL.PS(ptr64[ptr], reg);
-						xEXTRACTPS(ptr32[ptr+8], reg, 2);
-					}
-					else {
-						xMOVL.PS(ptr64[ptr], reg);
-						xMOVHL.PS(reg, reg);
-						xMOVSS(ptr32[ptr+8], reg);
-					}
-					break; // XYZ
-		case 4:		if (!modXYZW) mVUunpack_xyzw(reg, reg, 1);
-					xMOVSS(ptr32[ptr+4], reg);		
-					break; // Y
-		case 2:		if (!modXYZW) mVUunpack_xyzw(reg, reg, 2);
-					xMOVSS(ptr32[ptr+8], reg);	
-					break; // Z
-		case 1:		if (!modXYZW) mVUunpack_xyzw(reg, reg, 3);
-					xMOVSS(ptr32[ptr+12], reg);	
-					break; // W
-		case 8:		xMOVSS(ptr32[ptr], reg);	 break; // X
-		case 12:	xMOVL.PS(ptr64[ptr], reg);	 break; // XY
-		case 3:		xMOVH.PS(ptr64[ptr+8], reg); break; // ZW
-		default:	xMOVAPS(ptr128[ptr], reg);	 break; // XYZW
+	switch (xyzw)
+	{
+		case 5: // YW
+			xEXTRACTPS(ptr32[ptr + 4], reg, 1);
+			xEXTRACTPS(ptr32[ptr + 12], reg, 3);
+			break;
+		case 6: // YZ
+			xPSHUF.D(reg, reg, 0xc9);
+			xMOVL.PS(ptr64[ptr + 4], reg);
+			break;
+		case 7: // YZW
+			xMOVH.PS(ptr64[ptr + 8], reg);
+			xEXTRACTPS(ptr32[ptr + 4], reg, 1);
+			break;
+		case 9: // XW
+			xMOVSS(ptr32[ptr], reg);
+			xEXTRACTPS(ptr32[ptr + 12], reg, 3);
+			break;
+		case 10: // XZ
+			xMOVSS(ptr32[ptr], reg);
+			xEXTRACTPS(ptr32[ptr + 8], reg, 2);
+			break;
+		case 11: // XZW
+			xMOVSS(ptr32[ptr], reg);
+			xMOVH.PS(ptr64[ptr + 8], reg);
+			break;
+		case 13: // XYW
+			xMOVL.PS(ptr64[ptr], reg);
+			xEXTRACTPS(ptr32[ptr + 12], reg, 3);
+			break;
+		case 14: // XYZ
+			xMOVL.PS(ptr64[ptr], reg);
+			xEXTRACTPS(ptr32[ptr + 8], reg, 2);
+			break;
+		case 4: // Y
+			if (!modXYZW)
+				mVUunpack_xyzw(reg, reg, 1);
+			xMOVSS(ptr32[ptr + 4], reg);
+			break;
+		case 2: // Z
+			if (!modXYZW)
+				mVUunpack_xyzw(reg, reg, 2);
+			xMOVSS(ptr32[ptr + 8], reg);
+			break;
+		case 1: // W
+			if (!modXYZW)
+				mVUunpack_xyzw(reg, reg, 3);
+			xMOVSS(ptr32[ptr + 12], reg);
+			break;
+		case 8: // X
+			xMOVSS(ptr32[ptr], reg);
+			break;
+		case 12: // XY
+			xMOVL.PS(ptr64[ptr], reg);
+			break;
+		case 3: // ZW
+			xMOVH.PS(ptr64[ptr + 8], reg);
+			break;
+		default: // XYZW
+			xMOVAPS(ptr128[ptr], reg);
+			break;
 	}
 }
 
@@ -146,67 +110,24 @@ void mVUsaveReg(const xmm& reg, xAddressVoid ptr, int xyzw, bool modXYZW)
 void mVUmergeRegs(const xmm& dest, const xmm& src, int xyzw, bool modXYZW)
 {
 	xyzw &= 0xf;
-	if ( (dest != src) && (xyzw != 0) ) {
-		if (x86caps.hasStreamingSIMD4Extensions && (xyzw != 0x8) && (xyzw != 0xf)) {
-			if (modXYZW) {
-				if		(xyzw == 1) { xINSERTPS(dest, src, _MM_MK_INSERTPS_NDX(0, 3, 0)); return; }
+	if ((dest != src) && (xyzw != 0))
+	{
+		if (xyzw == 0x8)
+			xMOVSS(dest, src);
+		else if (xyzw == 0xf)
+			xMOVAPS(dest, src);
+		else
+		{
+			if (modXYZW)
+			{
+				if      (xyzw == 1) { xINSERTPS(dest, src, _MM_MK_INSERTPS_NDX(0, 3, 0)); return; }
 				else if (xyzw == 2) { xINSERTPS(dest, src, _MM_MK_INSERTPS_NDX(0, 2, 0)); return; }
 				else if (xyzw == 4) { xINSERTPS(dest, src, _MM_MK_INSERTPS_NDX(0, 1, 0)); return; }
 			}
 			xyzw = ((xyzw & 1) << 3) | ((xyzw & 2) << 1) | ((xyzw & 4) >> 1) | ((xyzw & 8) >> 3);
 			xBLEND.PS(dest, src, xyzw);
 		}
-		else {
-			switch (xyzw) {
-				case 1:  if (modXYZW) mVUunpack_xyzw(src, src, 0);
-						 xMOVHL.PS(src, dest);		 // src = Sw Sz Dw Dz
-						 xSHUF.PS(dest, src, 0xc4); // 11 00 01 00
-						 break;
-				case 2:  if (modXYZW) mVUunpack_xyzw(src, src, 0);
-						 xMOVHL.PS(src, dest);
-						 xSHUF.PS(dest, src, 0x64);
-						 break;
-				case 3:	 xSHUF.PS(dest, src, 0xe4);
-						 break;
-				case 4:	 if (modXYZW) mVUunpack_xyzw(src, src, 0);
-						 xMOVSS(src, dest);
-						 xMOVSD(dest, src);
-						 break;
-				case 5:	 xSHUF.PS(dest, src, 0xd8);
-						 xPSHUF.D(dest, dest, 0xd8);
-						 break;
-				case 6:	 xSHUF.PS(dest, src, 0x9c);
-						 xPSHUF.D(dest, dest, 0x78);
-						 break;
-				case 7:	 xMOVSS(src, dest);
-						 xMOVAPS(dest, src);
-						 break;
-				case 8:	 xMOVSS(dest, src);
-						 break;
-				case 9:	 xSHUF.PS(dest, src, 0xc9);
-						 xPSHUF.D(dest, dest, 0xd2);
-						 break;
-				case 10: xSHUF.PS(dest, src, 0x8d);
-						 xPSHUF.D(dest, dest, 0x72);
-						 break;
-				case 11: xMOVSS(dest, src);
-						 xSHUF.PS(dest, src, 0xe4);
-						 break;
-				case 12: xMOVSD(dest, src);
-						 break;
-				case 13: xMOVHL.PS(dest, src);
-						 xSHUF.PS(src, dest, 0x64);
-						 xMOVAPS(dest, src);
-						 break;
-				case 14: xMOVHL.PS(dest, src);
-						 xSHUF.PS(src, dest, 0xc4);
-						 xMOVAPS(dest, src);
-						 break;
-				default: xMOVAPS(dest, src);
-						 break;
-			}
-		}
-	} 
+	}
 }
 
 //------------------------------------------------------------------
@@ -214,105 +135,227 @@ void mVUmergeRegs(const xmm& dest, const xmm& src, int xyzw, bool modXYZW)
 //------------------------------------------------------------------
 
 // Backup Volatile Regs (EAX, ECX, EDX, MM0~7, XMM0~7, are all volatile according to 32bit Win/Linux ABI)
-__fi void mVUbackupRegs(microVU& mVU, bool toMemory = false) {
-	if (toMemory) {
-		for(int i = 0; i < 8; i++) {
-			xMOVAPS(ptr128[&mVU.xmmBackup[i][0]], xmm(i));
+__fi void mVUbackupRegs(microVU& mVU, bool toMemory = false, bool onlyNeeded = false)
+{
+	if (toMemory)
+	{
+		int num_xmms = 0, num_gprs = 0;
+
+		for (int i = 0; i < static_cast<int>(iREGCNT_GPR); i++)
+		{
+			if (!xRegister32::IsCallerSaved(i) || i == rsp.GetId())
+				continue;
+
+			if (!onlyNeeded || mVU.regAlloc->checkCachedGPR(i))
+			{
+				num_gprs++;
+				xPUSH(xRegister64(i));
+			}
+		}
+
+		std::bitset<iREGCNT_XMM> save_xmms;
+		for (int i = 0; i < static_cast<int>(iREGCNT_XMM); i++)
+		{
+			if (!xRegisterSSE::IsCallerSaved(i))
+				continue;
+
+			if (!onlyNeeded || mVU.regAlloc->checkCachedReg(i) || xmmPQ.Id == i)
+			{
+				save_xmms[i] = true;
+				num_xmms++;
+			}
+		}
+
+		// we need 16 byte alignment on the stack
+#ifdef _WIN32
+		const int stack_size = (num_xmms * sizeof(u128)) + ((num_gprs & 1) * sizeof(u64)) + 32;
+		int stack_offset = 32;
+#else
+		const int stack_size = (num_xmms * sizeof(u128)) + ((num_gprs & 1) * sizeof(u64));
+		int stack_offset = 0;
+#endif
+		if (stack_size > 0)
+		{
+			xSUB(rsp, stack_size);
+			for (int i = 0; i < static_cast<int>(iREGCNT_XMM); i++)
+			{
+				if (save_xmms[i])
+				{
+					xMOVAPS(ptr128[rsp + stack_offset], xRegisterSSE(i));
+					stack_offset += sizeof(u128);
+				}
+			}
 		}
 	}
-	else {
+	else
+	{
+		// TODO(Stenzek): get rid of xmmbackup
 		mVU.regAlloc->flushAll(); // Flush Regalloc
 		xMOVAPS(ptr128[&mVU.xmmBackup[xmmPQ.Id][0]], xmmPQ);
 	}
 }
 
 // Restore Volatile Regs
-__fi void mVUrestoreRegs(microVU& mVU, bool fromMemory = false) {
-	if (fromMemory) {
-		for(int i = 0; i < 8; i++) {
-			xMOVAPS(xmm(i), ptr128[&mVU.xmmBackup[i][0]]);
+__fi void mVUrestoreRegs(microVU& mVU, bool fromMemory = false, bool onlyNeeded = false)
+{
+	if (fromMemory)
+	{
+		int num_xmms = 0, num_gprs = 0;
+
+		std::bitset<iREGCNT_GPR> save_gprs;
+		for (int i = 0; i < static_cast<int>(iREGCNT_GPR); i++)
+		{
+			if (!xRegister32::IsCallerSaved(i) || i == rsp.GetId())
+				continue;
+
+			if (!onlyNeeded || mVU.regAlloc->checkCachedGPR(i))
+			{
+				save_gprs[i] = true;
+				num_gprs++;
+			}
+		}
+
+		std::bitset<iREGCNT_XMM> save_xmms;
+		for (int i = 0; i < static_cast<int>(iREGCNT_XMM); i++)
+		{
+			if (!xRegisterSSE::IsCallerSaved(i))
+				continue;
+
+			if (!onlyNeeded || mVU.regAlloc->checkCachedReg(i) || xmmPQ.Id == i)
+			{
+				save_xmms[i] = true;
+				num_xmms++;
+			}
+		}
+
+#ifdef _WIN32
+		const int stack_extra = 32;
+#else
+		const int stack_extra = 0;
+#endif
+		const int stack_size = (num_xmms * sizeof(u128)) + ((num_gprs & 1) * sizeof(u64)) + stack_extra;
+		if (num_xmms > 0)
+		{
+			int stack_offset = (num_xmms - 1) * sizeof(u128) + stack_extra;
+			for (int i = static_cast<int>(iREGCNT_XMM - 1); i >= 0; i--)
+			{
+				if (!save_xmms[i])
+					continue;
+
+				xMOVAPS(xRegisterSSE(i), ptr128[rsp + stack_offset]);
+				stack_offset -= sizeof(u128);
+			}
+		}
+		if (stack_size > 0)
+			xADD(rsp, stack_size);
+
+		for (int i = static_cast<int>(iREGCNT_GPR - 1); i >= 0; i--)
+		{
+			if (save_gprs[i])
+				xPOP(xRegister64(i));
 		}
 	}
-	else xMOVAPS(xmmPQ, ptr128[&mVU.xmmBackup[xmmPQ.Id][0]]);
-}
-
-_mVUt void __fc mVUprintRegs() {
-	microVU& mVU = mVUx;
-	for(int i = 0; i < 8; i++) {
-		Console.WriteLn("xmm%d = [0x%08x,0x%08x,0x%08x,0x%08x]", i,
-			mVU.xmmBackup[i][0], mVU.xmmBackup[i][1],
-			mVU.xmmBackup[i][2], mVU.xmmBackup[i][3]);
-	}
-	for(int i = 0; i < 8; i++) {
-		Console.WriteLn("xmm%d = [%f,%f,%f,%f]", i,
-			(float&)mVU.xmmBackup[i][0], (float&)mVU.xmmBackup[i][1],
-			(float&)mVU.xmmBackup[i][2], (float&)mVU.xmmBackup[i][3]);
+	else
+	{
+		xMOVAPS(xmmPQ, ptr128[&mVU.xmmBackup[xmmPQ.Id][0]]);
 	}
 }
 
+#if 0
 // Gets called by mVUaddrFix at execution-time
-static void __fc mVUwarningRegAccess(u32 prog, u32 pc) {
+static void mVUwarningRegAccess(u32 prog, u32 pc)
+{
 	Console.Error("microVU0 Warning: Accessing VU1 Regs! [%04x] [%x]", pc, prog);
 }
+#endif
 
-static inline u32 branchAddrN(const mV)
+static void mVUTBit()
 {
-	pxAssumeDev(islowerOP, "MicroVU: Expected Lower OP code for valid branch addr.");
-	return ((((iPC + 4) + (_Imm11_ * 2)) & mVU.progMemMask) * 4);
+	u32 old = vu1Thread.mtvuInterrupts.fetch_or(VU_Thread::InterruptFlagVUTBit, std::memory_order_release);
+	if (old & VU_Thread::InterruptFlagVUTBit)
+		DevCon.Warning("Old TBit not registered");
 }
 
+static void mVUEBit()
+{
+	vu1Thread.mtvuInterrupts.fetch_or(VU_Thread::InterruptFlagVUEBit, std::memory_order_release);
+}
 
 static inline u32 branchAddr(const mV)
 {
-	pxAssumeDev(islowerOP, "MicroVU: Expected Lower OP code for valid branch addr.");
+	pxAssumeMsg(islowerOP, "MicroVU: Expected Lower OP code for valid branch addr.");
 	return ((((iPC + 2) + (_Imm11_ * 2)) & mVU.progMemMask) * 4);
 }
 
-static void __fc mVUwaitMTVU() {
-	if (IsDevBuild) DevCon.WriteLn("microVU0: Waiting on VU1 thread to access VU1 regs!");
+static void mVUwaitMTVU()
+{
+	if (IsDevBuild)
+		DevCon.WriteLn("microVU0: Waiting on VU1 thread to access VU1 regs!");
 	vu1Thread.WaitVU();
 }
 
 // Transforms the Address in gprReg to valid VU0/VU1 Address
-__fi void mVUaddrFix(mV, const x32& gprReg)
+__fi void mVUaddrFix(mV, const xAddressReg& gprReg, const xAddressReg& tmpReg)
 {
-	if (isVU1) {
-		xAND(gprReg, 0x3ff); // wrap around
-		xSHL(gprReg, 4);
+	if (isVU1)
+	{
+		xAND(xRegister32(gprReg.Id), 0x3ff); // wrap around
+		xSHL(xRegister32(gprReg.Id), 4);
 	}
-	else {
-		xTEST(gprReg, 0x400);
-		xForwardJNZ8 jmpA;		// if addr & 0x4000, reads VU1's VF regs and VI regs
-			xAND(gprReg, 0xff); // if !(addr & 0x4000), wrap around
+	else
+	{
+		xTEST(xRegister32(gprReg.Id), 0x400);
+		xForwardJNZ8 jmpA; // if addr & 0x4000, reads VU1's VF regs and VI regs
+			xAND(xRegister32(gprReg.Id), 0xff); // if !(addr & 0x4000), wrap around
 			xForwardJump32 jmpB;
 		jmpA.SetTarget();
-			if (THREAD_VU1) {
-				mVUbackupRegs(mVU, true);
-				xPUSH(gprT1);
-				xPUSH(gprT2);
-				xPUSH(gprT3);
-				// Align the stackframe (GCC only, since GCC assumes stackframe is always aligned)
-#ifdef __GNUC__
-				xSUB(esp, 4);
+			if (THREAD_VU1)
+			{
+#if 0
+					if (IsDevBuild && !isCOP2) // Lets see which games do this!
+					{
+						xMOV(gprT1, mVU.prog.cur->idx); // Note: Kernel does it via COP2 to initialize VU1!
+						xMOV(gprT2, xPC);               // So we don't spam console, we'll only check micro-mode...
+						mVUbackupRegs(mVU, true, false);
+						xFastCall((void*)mVUwarningRegAccess, arg1regd, arg2regd);
+						mVUrestoreRegs(mVU, true, false);
+					}
 #endif
-				if (IsDevBuild && !isCOP2) {         // Lets see which games do this!
-					xMOV(gprT2, mVU.prog.cur->idx); // Note: Kernel does it via COP2 to initialize VU1!
-					xMOV(gprT3, xPC);               // So we don't spam console, we'll only check micro-mode...
-					xCALL((void*)mVUwarningRegAccess);
-				}
-				xCALL((void*)mVUwaitMTVU);
-#ifdef __GNUC__
-				xADD(esp, 4);
-#endif
-				xPOP (gprT3);
-				xPOP (gprT2);
-				xPOP (gprT1);
-				mVUrestoreRegs(mVU, true);
+				xFastCall((void*)mVU.waitMTVU);
 			}
-			xAND(gprReg, 0x3f); // ToDo: theres a potential problem if VU0 overrides VU1's VF0/VI0 regs!
-			xADD(gprReg, (u128*)VU1.VF - (u128*)VU0.Mem);
+			xAND(xRegister32(gprReg.Id), 0x3f); // ToDo: theres a potential problem if VU0 overrides VU1's VF0/VI0 regs!
+			sptr offset = (u128*)VU1.VF - (u128*)VU0.Mem;
+			if (offset == (s32)offset)
+			{
+				xADD(gprReg, (s32)offset);
+			}
+			else
+			{
+				xMOV64(tmpReg, offset);
+				xADD(gprReg, tmpReg);
+			}
 		jmpB.SetTarget();
 		xSHL(gprReg, 4); // multiply by 16 (shift left by 4)
+	}
+}
+
+__fi std::optional<xAddressVoid> mVUoptimizeConstantAddr(mV, u32 srcreg, s32 offset, s32 offsetSS_)
+{
+	// if we had const prop for VIs, we could do that here..
+	if (srcreg != 0)
+		return std::nullopt;
+
+	const s32 addr = 0 + offset;
+	if (isVU1)
+	{
+		return ptr[mVU.regs().Mem + ((addr & 0x3FFu) << 4) + offsetSS_];
+	}
+	else
+	{
+		if (addr & 0x400)
+			return std::nullopt;
+
+		return ptr[mVU.regs().Mem + ((addr & 0xFFu) << 4) + offsetSS_];
 	}
 }
 
@@ -320,13 +363,16 @@ __fi void mVUaddrFix(mV, const x32& gprReg)
 // Micro VU - Custom SSE Instructions
 //------------------------------------------------------------------
 
-struct SSEMasks { u32 MIN_MAX_1[4], MIN_MAX_2[4], ADD_SS[4]; };
+struct SSEMasks
+{
+	u32 MIN_MAX_1[4], MIN_MAX_2[4], ADD_SS[4];
+};
 
-static const __aligned16 SSEMasks sseMasks =
+alignas(16) static const SSEMasks sseMasks =
 {
 	{0xffffffff, 0x80000000, 0xffffffff, 0x80000000},
 	{0x00000000, 0x40000000, 0x00000000, 0x40000000},
-	{0x80000000, 0xffffffff, 0xffffffff, 0xffffffff}
+	{0x80000000, 0xffffffff, 0xffffffff, 0xffffffff},
 };
 
 
@@ -336,7 +382,8 @@ void MIN_MAX_PS(microVU& mVU, const xmm& to, const xmm& from, const xmm& t1in, c
 	const xmm& t1 = t1in.IsEmpty() ? mVU.regAlloc->allocReg() : t1in;
 	const xmm& t2 = t2in.IsEmpty() ? mVU.regAlloc->allocReg() : t2in;
 
-	if (0) { // use double comparison
+	if (0) // use double comparison
+	{
 		// ZW
 		xPSHUF.D(t1, to, 0xfa);
 		xPAND   (t1, ptr128[sseMasks.MIN_MAX_1]);
@@ -359,7 +406,8 @@ void MIN_MAX_PS(microVU& mVU, const xmm& to, const xmm& from, const xmm& t1in, c
 
 		xSHUF.PS(to, t1, 0x88);
 	}
-	else { // use integer comparison
+	else // use integer comparison
+	{
 		const xmm& c1 = min ? t2 : t1;
 		const xmm& c2 = min ? t1 : t2;
 
@@ -388,12 +436,13 @@ void MIN_MAX_SS(mV, const xmm& to, const xmm& from, const xmm& t1in, bool min)
 {
 	const xmm& t1 = t1in.IsEmpty() ? mVU.regAlloc->allocReg() : t1in;
 	xSHUF.PS(to, from, 0);
-	xPAND	(to, ptr128[sseMasks.MIN_MAX_1]);
-	xPOR	(to, ptr128[sseMasks.MIN_MAX_2]);
+	xPAND   (to, ptr128[sseMasks.MIN_MAX_1]);
+	xPOR    (to, ptr128[sseMasks.MIN_MAX_2]);
 	xPSHUF.D(t1, to, 0xee);
 	if (min) xMIN.PD(to, t1);
 	else	 xMAX.PD(to, t1);
-	if (t1 != t1in) mVU.regAlloc->clearNeeded(t1);
+	if (t1 != t1in)
+		mVU.regAlloc->clearNeeded(t1);
 }
 
 // Not Used! - TriAce games only need a portion of this code to boot (see function below)
@@ -451,7 +500,8 @@ void ADD_SS_Single_Guard_Bit(microVU& mVU, const xmm& to, const xmm& from, const
 	case_end4.SetTarget();
 
 	xADD.SS(to, from);
-	if (t1 != t1in) mVU.regAlloc->clearNeeded(t1);
+	if (t1 != t1in)
+		mVU.regAlloc->clearNeeded(t1);
 }
 
 // Turns out only this is needed to get TriAce games booting with mVU
@@ -484,37 +534,36 @@ void ADD_SS_TriAceHack(microVU& mVU, const xmm& to, const xmm& from)
 	xADD.SS(to, from);
 }
 
-#define clampOp(opX, isPS) {					\
-	mVUclamp3(mVU, to,   t1, (isPS)?0xf:0x8);	\
-	mVUclamp3(mVU, from, t1, (isPS)?0xf:0x8);	\
-	opX(to, from);								\
-	mVUclamp4(to, t1, (isPS)?0xf:0x8);			\
-}
+#define clampOp(opX, isPS) \
+	do { \
+		mVUclamp3(mVU, to, t1, (isPS) ? 0xf : 0x8); \
+		mVUclamp3(mVU, from, t1, (isPS) ? 0xf : 0x8); \
+		opX(to, from); \
+		mVUclamp4(mVU, to, t1, (isPS) ? 0xf : 0x8); \
+	} while (0)
 
 void SSE_MAXPS(mV, const xmm& to, const xmm& from, const xmm& t1 = xEmptyReg, const xmm& t2 = xEmptyReg)
 {
-	if (CHECK_VU_MINMAXHACK) { xMAX.PS(to, from); }
-	else					 { MIN_MAX_PS(mVU, to, from, t1, t2, false); }
+	MIN_MAX_PS(mVU, to, from, t1, t2, false);
 }
 void SSE_MINPS(mV, const xmm& to, const xmm& from, const xmm& t1 = xEmptyReg, const xmm& t2 = xEmptyReg)
 {
-	if (CHECK_VU_MINMAXHACK) { xMIN.PS(to, from); }
-	else					 { MIN_MAX_PS(mVU, to, from, t1, t2, true); }
+	MIN_MAX_PS(mVU, to, from, t1, t2, true);
 }
 void SSE_MAXSS(mV, const xmm& to, const xmm& from, const xmm& t1 = xEmptyReg, const xmm& t2 = xEmptyReg)
 {
-	if (CHECK_VU_MINMAXHACK) { xMAX.SS(to, from); }
-	else					 { MIN_MAX_SS(mVU, to, from, t1, false); }
+	MIN_MAX_SS(mVU, to, from, t1, false);
 }
 void SSE_MINSS(mV, const xmm& to, const xmm& from, const xmm& t1 = xEmptyReg, const xmm& t2 = xEmptyReg)
 {
-	if (CHECK_VU_MINMAXHACK) { xMIN.SS(to, from); }
-	else					 { MIN_MAX_SS(mVU, to, from, t1, true); }
+	MIN_MAX_SS(mVU, to, from, t1, true);
 }
 void SSE_ADD2SS(mV, const xmm& to, const xmm& from, const xmm& t1 = xEmptyReg, const xmm& t2 = xEmptyReg)
 {
-	if (!CHECK_VUADDSUBHACK) { clampOp(xADD.SS, false); }
-	else					 { ADD_SS_TriAceHack(mVU, to, from); }
+	if (!CHECK_VUADDSUBHACK)
+		clampOp(xADD.SS, false);
+	else
+		ADD_SS_TriAceHack(mVU, to, from);
 }
 
 // Does same as SSE_ADDPS since tri-ace games only need SS implementation of VUADDSUBHACK...
@@ -553,61 +602,4 @@ void SSE_DIVPS(mV, const xmm& to, const xmm& from, const xmm& t1 = xEmptyReg, co
 void SSE_DIVSS(mV, const xmm& to, const xmm& from, const xmm& t1 = xEmptyReg, const xmm& t2 = xEmptyReg)
 {
 	clampOp(xDIV.SS, false);
-}
-
-//------------------------------------------------------------------
-// Micro VU - Custom Quick Search
-//------------------------------------------------------------------
-
-__pagealigned u8 mVUsearchXMM[__pagesize];
-
-// Generates a custom optimized block-search function
-// Note: Structs must be 16-byte aligned! (GCC doesn't guarantee this)
-void mVUcustomSearch() {
-	HostSys::MemProtectStatic(mVUsearchXMM, PageAccess_ReadWrite());
-	memset(mVUsearchXMM, 0xcc, __pagesize);
-	xSetPtr(mVUsearchXMM);
-
-	xMOVAPS  (xmm0, ptr32[ecx]);
-	xPCMP.EQD(xmm0, ptr32[edx]);
-	xMOVAPS  (xmm1, ptr32[ecx + 0x10]);
-	xPCMP.EQD(xmm1, ptr32[edx + 0x10]);
-	xPAND	 (xmm0, xmm1);
-
-	xMOVMSKPS(eax, xmm0);
-	xCMP	 (eax, 0xf);
-	xForwardJL8 exitPoint;
-
-	xMOVAPS  (xmm0, ptr32[ecx + 0x20]);
-	xPCMP.EQD(xmm0, ptr32[edx + 0x20]);
-	xMOVAPS	 (xmm1, ptr32[ecx + 0x30]);
-	xPCMP.EQD(xmm1, ptr32[edx + 0x30]);
-	xPAND	 (xmm0, xmm1);
-
-	xMOVAPS  (xmm2, ptr32[ecx + 0x40]);
-	xPCMP.EQD(xmm2, ptr32[edx + 0x40]);
-	xMOVAPS  (xmm3, ptr32[ecx + 0x50]);
-	xPCMP.EQD(xmm3, ptr32[edx + 0x50]);
-	xPAND	 (xmm2, xmm3);
-
-	xMOVAPS	 (xmm4, ptr32[ecx + 0x60]);
-	xPCMP.EQD(xmm4, ptr32[edx + 0x60]);
-	xMOVAPS	 (xmm5, ptr32[ecx + 0x70]);
-	xPCMP.EQD(xmm5, ptr32[edx + 0x70]);
-	xPAND	 (xmm4, xmm5);
-
-	xMOVAPS  (xmm6, ptr32[ecx + 0x80]);
-	xPCMP.EQD(xmm6, ptr32[edx + 0x80]);
-	xMOVAPS  (xmm7, ptr32[ecx + 0x90]);
-	xPCMP.EQD(xmm7, ptr32[edx + 0x90]);
-	xPAND	 (xmm6, xmm7);
-
-	xPAND (xmm0, xmm2);
-	xPAND (xmm4, xmm6);
-	xPAND (xmm0, xmm4);
-	xMOVMSKPS(eax, xmm0);
-
-	exitPoint.SetTarget();
-	xRET();
-	HostSys::MemProtectStatic(mVUsearchXMM, PageAccess_ExecOnly());
 }

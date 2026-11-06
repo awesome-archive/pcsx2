@@ -1,20 +1,11 @@
-/*  PCSX2 - PS2 Emulator for PCs
-*  Copyright (C) 2002-2016  PCSX2 Dev Team
-*
-*  PCSX2 is free software: you can redistribute it and/or modify it under the terms
-*  of the GNU Lesser General Public License as published by the Free Software Found-
-*  ation, either version 3 of the License, or (at your option) any later version.
-*
-*  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
-*  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
-*  PURPOSE.  See the GNU General Public License for more details.
-*
-*  You should have received a copy of the GNU General Public License along with PCSX2.
-*  If not, see <http://www.gnu.org/licenses/>.
-*/
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
-#include "PrecompiledHeader.h"
-#include "IopCommon.h"
+#include "Common.h"
+#include "R3000A.h"
+#include "IopMem.h"
+
+#include "fmt/format.h"
 
 static std::string psxout_buf;
 
@@ -24,10 +15,8 @@ static unsigned psxout_repeat;
 
 static void flush_stdout(bool closing = false)
 {
-    size_t linelen;
-
     while (!psxout_buf.empty()) {
-        linelen = psxout_buf.find_first_of("\n\0", 0, 2);
+        size_t linelen = psxout_buf.find_first_of("\n\0", 0, 2);
         if (linelen == std::string::npos) {
             if (!closing)
                 return;
@@ -38,7 +27,7 @@ static void flush_stdout(bool closing = false)
                 psxout_repeat++;
             else {
                 if (psxout_repeat) {
-                    iopConLog(wxString::Format(L"[%u more]\n", psxout_repeat));
+                    iopConLog(fmt::format("[{} more]\n", psxout_repeat));
                     psxout_repeat = 0;
                 }
                 psxout_last = psxout_buf.substr(0, linelen);
@@ -48,7 +37,7 @@ static void flush_stdout(bool closing = false)
         psxout_buf.erase(0, linelen);
     }
     if (closing && psxout_repeat) {
-        iopConLog(wxString::Format(L"[%u more]\n", psxout_repeat));
+        iopConLog(fmt::format("[{} more]\n", psxout_repeat));
         psxout_repeat = 0;
     }
 }
@@ -58,14 +47,14 @@ void psxBiosReset()
     flush_stdout(true);
 }
 
-// Called for Playstation BIOS calls at 0xA0, 0xB0 and 0xC0 in kernel reserved memory (seemingly by actually calling those addresses)
+// Called for PlayStation BIOS calls at 0xA0, 0xB0 and 0xC0 in kernel reserved memory (seemingly by actually calling those addresses)
 // Returns true if we internally process the call, not that we're likely to do any such thing
-bool __fastcall psxBiosCall()
+bool psxBiosCall()
 {
     // TODO: Tracing
     // TODO (maybe, psx is hardly a priority): HLE framework
 
-    switch ((psxRegs.pc & 0x1FFFFFFFU) << 4 & 0xf00 | psxRegs.GPR.n.t1 & 0xff) {
+    switch (((psxRegs.pc << 4) & 0xf00) | (psxRegs.GPR.n.t1 & 0xff)) {
         case 0xa03:
         case 0xb35:
             // write(fd, data, size)
@@ -86,6 +75,7 @@ bool __fastcall psxBiosCall()
             // putc(c, fd)
             if (psxRegs.GPR.n.a1 != 1)
                 return false;
+            [[fallthrough]];
         // fd=1, fall through to putchar
         case 0xa3c:
         case 0xb3d:

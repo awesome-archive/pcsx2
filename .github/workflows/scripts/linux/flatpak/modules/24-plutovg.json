@@ -1,0 +1,28 @@
+{
+  "name": "plutovg",
+  "buildsystem": "cmake-ninja",
+  "builddir": true,
+  "config-opts": [
+    "-DBUILD_SHARED_LIBS=ON",
+    "-DPLUTOVG_BUILD_EXAMPLES=OFF"
+  ],
+  "build-options": {
+    "strip": true
+  },
+  "sources": [
+    {
+      "type": "git",
+      "url": "https://github.com/sammycage/plutovg.git",
+      "tag": "v1.3.3",
+      "commit": "bbd91f0d06a71491691b36330f29dffa4af87ccf"
+    }
+  ],
+  "cleanup": [
+    "/bin",
+    "/include",
+    "/lib/*.a",
+    "/lib/*.la",
+    "/lib/cmake",
+    "/lib/pkgconfig"
+  ]
+}

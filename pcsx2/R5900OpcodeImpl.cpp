@@ -1,28 +1,20 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
-
-#include "PrecompiledHeader.h"
 #include "Common.h"
 
 #include <float.h>
 
 #include "R5900.h"
 #include "R5900OpcodeTables.h"
-#include "R5900Exceptions.h"
 #include "GS.h"
+#include "ps2/BiosTools.h"
+#include "DebugTools/DebugInterface.h"
+#include "DebugTools/Breakpoints.h"
+#include "Host.h"
+#include "VMManager.h"
+
+#include "fmt/format.h"
 
 GS_VideoMode gsVideoMode = GS_VideoMode::Uninitialized;
 bool gsIsInterlaced = false;
@@ -62,7 +54,7 @@ static __fi bool _add32_Overflow( s32 x, s32 y, s64 &ret )
 		cpuException(0x30, cpuRegs.branch);
 		return true;
 	}
-	
+
 	ret = result.SD[0];
 
 	return false;
@@ -131,7 +123,7 @@ const char * const R5900::bios[256]=
 	"KSeg0",				"EnableCache",	"DisableCache",			"GetCop0",
 	"FlushCache",			"RFU101",		"CpuConfig",			"iGetCop0",
 	"iFlushCache",			"RFU105",		"iCpuConfig", 			"sceSifStopDma",
-	"SetCPUTimerHandler",	"SetCPUTimer",	"SetOsdConfigParam2",	"SetOsdConfigParam2",
+	"SetCPUTimerHandler",	"SetCPUTimer",	"SetOsdConfigParam2",	"GetOsdConfigParam2",
 //0x70
 	"GsGetIMR_iGsGetIMR",				"GsGetIMR_iGsPutIMR",	"SetPgifHandler", 				"SetVSyncFlag",
 	"RFU116",							"print", 				"sceSifDmaStat_isceSifDmaStat", "sceSifSetDma_isceSifSetDma",
@@ -147,16 +139,19 @@ void Deci2Reset()
 {
 	deci2handler	= 0;
 	deci2addr		= 0;
-	memzero( deci2buffer );
+	std::memset(deci2buffer, 0, sizeof(deci2buffer));
 }
 
-void SaveStateBase::deci2Freeze()
+bool SaveStateBase::deci2Freeze()
 {
-	FreezeTag( "deci2" );
+	if (!FreezeTag("deci2"))
+		return false;
 
 	Freeze( deci2addr );
 	Freeze( deci2handler );
 	Freeze( deci2buffer );
+
+	return IsOkay();
 }
 
 /*
@@ -196,10 +191,10 @@ static int __Deci2Call(int call, u32 *addr)
 		{
 			char reqaddr[128];
 			if( addr != NULL )
-				sprintf( reqaddr, "%x %x %x %x", addr[3], addr[2], addr[1], addr[0] );
+				std::snprintf(reqaddr, std::size(reqaddr), "%x %x %x %x", addr[3], addr[2], addr[1], addr[0]);
 
 			if (!deci2addr) return 1;
-			
+
 			const u32* d2ptr = (u32*)PSM(deci2addr);
 
 			BIOS_LOG("deci2reqsend: %s: deci2addr: %x,%x,%x,buf=%x %x,%x,len=%x,%x",
@@ -298,7 +293,7 @@ void ADDI()
 void ADDIU()
 {
 	if (!_Rt_) return;
-	cpuRegs.GPR.r[_Rt_].SD[0] = cpuRegs.GPR.r[_Rs_].SL[0] + _Imm_;
+	cpuRegs.GPR.r[_Rt_].UD[0] = u64(s64(s32(cpuRegs.GPR.r[_Rs_].UL[0] + u32(s32(_Imm_)))));
 }
 
 // Rt = Rs + Im [exception on overflow]
@@ -318,7 +313,7 @@ void DADDI()
 void DADDIU()
 {
 	if (!_Rt_) return;
-	cpuRegs.GPR.r[_Rt_].UD[0] = cpuRegs.GPR.r[_Rs_].SD[0] + _Imm_;
+	cpuRegs.GPR.r[_Rt_].UD[0] = cpuRegs.GPR.r[_Rs_].UD[0] + u64(s64(_Imm_));
 }
 void ANDI() 	{ if (!_Rt_) return; cpuRegs.GPR.r[_Rt_].UD[0] = cpuRegs.GPR.r[_Rs_].UD[0] & (u64)_ImmU_; } // Rt = Rs And Im (zero-extended)
 void ORI() 	    { if (!_Rt_) return; cpuRegs.GPR.r[_Rt_].UD[0] = cpuRegs.GPR.r[_Rs_].UD[0] | (u64)_ImmU_; } // Rt = Rs Or  Im (zero-extended)
@@ -366,10 +361,10 @@ void DSUB()
 	cpuRegs.GPR.r[_Rd_].SD[0] = result;
 }
 
-void ADDU() 	{ if (!_Rd_) return; cpuRegs.GPR.r[_Rd_].UD[0] = cpuRegs.GPR.r[_Rs_].SL[0]  + cpuRegs.GPR.r[_Rt_].SL[0];}	// Rd = Rs + Rt
-void DADDU()    { if (!_Rd_) return; cpuRegs.GPR.r[_Rd_].UD[0] = cpuRegs.GPR.r[_Rs_].SD[0]  + cpuRegs.GPR.r[_Rt_].SD[0]; }
-void SUBU() 	{ if (!_Rd_) return; cpuRegs.GPR.r[_Rd_].UD[0] = cpuRegs.GPR.r[_Rs_].SL[0]  - cpuRegs.GPR.r[_Rt_].SL[0]; }	// Rd = Rs - Rt
-void DSUBU() 	{ if (!_Rd_) return; cpuRegs.GPR.r[_Rd_].UD[0] = cpuRegs.GPR.r[_Rs_].SD[0]  - cpuRegs.GPR.r[_Rt_].SD[0]; }
+void ADDU() 	{ if (!_Rd_) return; cpuRegs.GPR.r[_Rd_].UD[0] = u64(s64(s32(cpuRegs.GPR.r[_Rs_].UL[0]  + cpuRegs.GPR.r[_Rt_].UL[0]))); }	// Rd = Rs + Rt
+void DADDU()    { if (!_Rd_) return; cpuRegs.GPR.r[_Rd_].UD[0] = cpuRegs.GPR.r[_Rs_].UD[0]  + cpuRegs.GPR.r[_Rt_].UD[0]; }
+void SUBU() 	{ if (!_Rd_) return; cpuRegs.GPR.r[_Rd_].UD[0] = u64(s64(s32(cpuRegs.GPR.r[_Rs_].UL[0]  - cpuRegs.GPR.r[_Rt_].UL[0]))); }	// Rd = Rs - Rt
+void DSUBU() 	{ if (!_Rd_) return; cpuRegs.GPR.r[_Rd_].UD[0] = cpuRegs.GPR.r[_Rs_].UD[0]  - cpuRegs.GPR.r[_Rt_].UD[0]; }
 void AND() 	    { if (!_Rd_) return; cpuRegs.GPR.r[_Rd_].UD[0] = cpuRegs.GPR.r[_Rs_].UD[0]  & cpuRegs.GPR.r[_Rt_].UD[0]; }	// Rd = Rs And Rt
 void OR() 	    { if (!_Rd_) return; cpuRegs.GPR.r[_Rd_].UD[0] = cpuRegs.GPR.r[_Rs_].UD[0]  | cpuRegs.GPR.r[_Rt_].UD[0]; }	// Rd = Rs Or  Rt
 void XOR() 	    { if (!_Rd_) return; cpuRegs.GPR.r[_Rd_].UD[0] = cpuRegs.GPR.r[_Rs_].UD[0]  ^ cpuRegs.GPR.r[_Rt_].UD[0]; }	// Rd = Rs Xor Rt
@@ -512,6 +507,15 @@ void DSRLV(){ if (!_Rd_) return; cpuRegs.GPR.r[_Rd_].UD[0] = (u64)(cpuRegs.GPR.r
 //    exceptions, since the lower bits of the address are used to determine the portions
 //    of the address/register operations.
 
+__noinline static void RaiseAddressError(u32 addr, bool store)
+{
+	const std::string message(fmt::format("Address Error, addr=0x{:x} [{}]", addr, store ? "store" : "load"));
+
+	// TODO: This doesn't actually get raised in the CPU yet.
+	Console.Error(message);
+
+	Cpu->CancelInstruction();
+}
 
 void LB()
 {
@@ -520,6 +524,13 @@ void LB()
 
 	if (!_Rt_) return;
 	cpuRegs.GPR.r[_Rt_].SD[0] = temp;
+
+	// Force event test on EE counter read to improve read + interrupt syncing. Namely ESPN Games.
+	if ((addr & 0xFFFFE000) == 0x10000000)
+	{
+		intUpdateCPUCycles();
+		intEventTest();
+	}
 }
 
 void LBU()
@@ -529,53 +540,81 @@ void LBU()
 
 	if (!_Rt_) return;
 	cpuRegs.GPR.r[_Rt_].UD[0] = temp;
+
+	// Force event test on EE counter read to improve read + interrupt syncing. Namely ESPN Games.
+	if ((addr & 0xFFFFE000) == 0x10000000)
+	{
+		intUpdateCPUCycles();
+		intEventTest();
+	}
 }
 
 void LH()
 {
 	u32 addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
 
-	if( addr & 1 )
-		throw R5900Exception::AddressError( addr, false );
+	if (addr & 1) [[unlikely]]
+		RaiseAddressError(addr, false);
 
 	s16 temp = memRead16(addr);
 
 	if (!_Rt_) return;
 	cpuRegs.GPR.r[_Rt_].SD[0] = temp;
+
+	// Force event test on EE counter read to improve read + interrupt syncing. Namely ESPN Games.
+	if ((addr & 0xFFFFE000) == 0x10000000)
+	{
+		intUpdateCPUCycles();
+		intEventTest();
+	}
 }
 
 void LHU()
 {
 	u32 addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
 
-	if( addr & 1 )
-		throw R5900Exception::AddressError( addr, false );
+	if (addr & 1) [[unlikely]]
+		RaiseAddressError(addr, false);
 
 	u16 temp = memRead16(addr);
 
 	if (!_Rt_) return;
 	cpuRegs.GPR.r[_Rt_].UD[0] = temp;
+
+	// Force event test on EE counter read to improve read + interrupt syncing. Namely ESPN Games.
+	if ((addr & 0xFFFFE000) == 0x10000000)
+	{
+		intUpdateCPUCycles();
+		intEventTest();
+	}
 }
 
 void LW()
 {
 	u32 addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
 
-	if( addr & 3 )
-		throw R5900Exception::AddressError( addr, false );
+	if (addr & 3) [[unlikely]]
+		RaiseAddressError(addr, false);
 
 	u32 temp = memRead32(addr);
 
 	if (!_Rt_) return;
 	cpuRegs.GPR.r[_Rt_].SD[0] = (s32)temp;
+
+	// Force event test on EE counter read to improve read + interrupt syncing. Namely ESPN Games.
+	if ((addr & 0xFFFFE000) == 0x10000000)
+	{
+		intUpdateCPUCycles();
+		intEventTest();
+	}
 }
 
 void LWU()
 {
 	u32 addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
 
-	if( addr & 3 )
-		throw R5900Exception::AddressError( addr, false );
+	if (addr & 3) [[unlikely]]
+		RaiseAddressError(addr, false);
 
 	u32 temp = memRead32(addr);
 
@@ -593,13 +632,13 @@ void LWL()
 	s32 addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
 	u32 shift = addr & 3;
 
-	// ensure the compiler does correct sign extension into 64 bits by using s32
-	s32 mem = memRead32(addr & ~3);
+	u32 mem = memRead32(addr & ~3);
 
 	if (!_Rt_) return;
 
-	cpuRegs.GPR.r[_Rt_].SD[0] =	(cpuRegs.GPR.r[_Rt_].SL[0] & LWL_MASK[shift]) |
-								(mem << LWL_SHIFT[shift]);
+	// ensure the compiler does correct sign extension into 64 bits by using s32
+	cpuRegs.GPR.r[_Rt_].SD[0] =	(s32)((cpuRegs.GPR.r[_Rt_].UL[0] & LWL_MASK[shift]) |
+								(mem << LWL_SHIFT[shift]));
 
 	/*
 	Mem = 1234.  Reg = abcd
@@ -648,7 +687,7 @@ void LWR()
 
 // dummy variable used as a destination address for writes to the zero register, so
 // that the zero register always stays zero.
-static __aligned16 GPR_reg m_dummy_gpr_zero;
+alignas(16) static GPR_reg m_dummy_gpr_zero;
 
 // Returns the x86 address of the requested GPR, which is safe for writing. (includes
 // special handling for returning a dummy var for GPR0(zero), so that it's value is
@@ -662,10 +701,12 @@ void LD()
 {
     s32 addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
 
-	if( addr & 7 )
-		throw R5900Exception::AddressError( addr, false );
+	if (addr & 7) [[unlikely]]
+		RaiseAddressError(addr, false);
 
-	memRead64(addr, (u64*)gpr_GetWritePtr(_Rt_));
+	if (!_Rt_) return;
+
+	cpuRegs.GPR.r[_Rt_].UD[0] = memRead64(addr);
 }
 
 static const u64 LDL_MASK[8] =
@@ -686,8 +727,7 @@ void LDL()
 	u32 addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
 	u32 shift = addr & 7;
 
-	u64 mem;
-	memRead64(addr & ~7, &mem);
+	u64 mem = memRead64(addr & ~7);
 
 	if( !_Rt_ ) return;
 	cpuRegs.GPR.r[_Rt_].UD[0] =	(cpuRegs.GPR.r[_Rt_].UD[0] & LDL_MASK[shift]) |
@@ -699,8 +739,7 @@ void LDR()
 	u32 addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
 	u32 shift = addr & 7;
 
-	u64 mem;
-	memRead64(addr & ~7, &mem);
+	u64 mem = memRead64(addr & ~7);
 
 	if (!_Rt_) return;
 	cpuRegs.GPR.r[_Rt_].UD[0] =	(cpuRegs.GPR.r[_Rt_].UD[0] & LDR_MASK[shift]) |
@@ -726,8 +765,8 @@ void SH()
 {
 	u32 addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
 
-	if( addr & 1 )
-		throw R5900Exception::AddressError( addr, true );
+	if (addr & 1) [[unlikely]]
+		RaiseAddressError(addr, true);
 
 	memWrite16(addr, cpuRegs.GPR.r[_Rt_].US[0]);
 }
@@ -736,10 +775,10 @@ void SW()
 {
 	u32 addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
 
-	if( addr & 3 )
-		throw R5900Exception::AddressError( addr, true );
+	if (addr & 3) [[unlikely]]
+		RaiseAddressError(addr, true);
 
-    memWrite32(addr, cpuRegs.GPR.r[_Rt_].UL[0]);
+  memWrite32(addr, cpuRegs.GPR.r[_Rt_].UL[0]);
 }
 
 static const u32 SWL_MASK[4] = { 0xffffff00, 0xffff0000, 0xff000000, 0x00000000 };
@@ -793,10 +832,10 @@ void SD()
 {
 	u32 addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
 
-	if( addr & 7 )
-		throw R5900Exception::AddressError( addr, true );
+	if (addr & 7) [[unlikely]]
+		RaiseAddressError(addr, true);
 
-    memWrite64(addr,&cpuRegs.GPR.r[_Rt_].UD[0]);
+    memWrite64(addr,cpuRegs.GPR.r[_Rt_].UD[0]);
 }
 
 static const u64 SDL_MASK[8] =
@@ -815,12 +854,10 @@ void SDL()
 {
 	u32 addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
 	u32 shift = addr & 7;
-	u64 mem;
-
-	memRead64(addr & ~7, &mem);
+	u64 mem = memRead64(addr & ~7);
 	mem = (cpuRegs.GPR.r[_Rt_].UD[0] >> SDL_SHIFT[shift]) |
 		  (mem & SDL_MASK[shift]);
-	memWrite64(addr & ~7, &mem);
+	memWrite64(addr & ~7, mem);
 }
 
 
@@ -828,12 +865,10 @@ void SDR()
 {
 	u32 addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
 	u32 shift = addr & 7;
-	u64 mem;
-
-	memRead64(addr & ~7, &mem);
+	u64 mem = memRead64(addr & ~7);
 	mem = (cpuRegs.GPR.r[_Rt_].UD[0] << SDR_SHIFT[shift]) |
 		  (mem & SDR_MASK[shift]);
-	memWrite64(addr & ~7, &mem );
+	memWrite64(addr & ~7, mem );
 }
 
 void SQ()
@@ -888,71 +923,188 @@ void SYSCALL()
 	{
 		case Syscall::SetGsCrt:
 		{
-					//Function "SetGsCrt(Interlace, Mode, Field)"
-					//Useful for fetching information of interlace/video/field display parameters of the Graphics Synthesizer
+			//Function "SetGsCrt(Interlace, Mode, Field)"
+			//Useful for fetching information of interlace/video/field display parameters of the Graphics Synthesizer
 
-					gsIsInterlaced = cpuRegs.GPR.n.a0.UL[0] & 1;
-					bool gsIsFrameMode = cpuRegs.GPR.n.a2.UL[0] & 1;
-					const char* inter = (gsIsInterlaced) ? "Interlaced" : "Progressive";
-					const char* field = (gsIsFrameMode) ? "FRAME" : "FIELD";
-					std::string mode;
-					// Warning info might be incorrect!
-					switch (cpuRegs.GPR.n.a1.UC[0])
-					{
-						case 0x0:
-						case 0x2:
-							mode = "NTSC 640x448 @ 59.940 (59.82)"; gsSetVideoMode(GS_VideoMode::NTSC); break;
+			gsIsInterlaced = cpuRegs.GPR.n.a0.UL[0] & 1;
+			bool gsIsFrameMode = cpuRegs.GPR.n.a2.UL[0] & 1;
+			const char* inter = (gsIsInterlaced) ? "Interlaced" : "Progressive";
+			const char* field = (gsIsFrameMode) ? "FRAME" : "FIELD";
+			std::string mode;
+			// Warning info might be incorrect!
+			switch (cpuRegs.GPR.n.a1.UC[0])
+			{
+				case 0x0:
+				case 0x2:
+					mode = "NTSC 640x448 @ 59.940 (59.82)"; gsSetVideoMode(GS_VideoMode::NTSC); break;
 
-						case 0x1:
-						case 0x3:
-							mode = "PAL  640x512 @ 50.000 (49.76)"; gsSetVideoMode(GS_VideoMode::PAL); break;
+				case 0x1:
+				case 0x3:
+					mode = "PAL  640x512 @ 50.000 (49.76)"; gsSetVideoMode(GS_VideoMode::PAL); break;
 
-						case 0x1A: mode = "VESA 640x480 @ 59.940"; gsSetVideoMode(GS_VideoMode::VESA); break;
-						case 0x1B: mode = "VESA 640x480 @ 72.809"; gsSetVideoMode(GS_VideoMode::VESA); break;
-						case 0x1C: mode = "VESA 640x480 @ 75.000"; gsSetVideoMode(GS_VideoMode::VESA); break;
-						case 0x1D: mode = "VESA 640x480 @ 85.008"; gsSetVideoMode(GS_VideoMode::VESA); break;
+				case 0x1A: mode = "VESA 640x480 @ 59.940"; gsSetVideoMode(GS_VideoMode::VESA); break;
+				case 0x1B: mode = "VESA 640x480 @ 72.809"; gsSetVideoMode(GS_VideoMode::VESA); break;
+				case 0x1C: mode = "VESA 640x480 @ 75.000"; gsSetVideoMode(GS_VideoMode::VESA); break;
+				case 0x1D: mode = "VESA 640x480 @ 85.008"; gsSetVideoMode(GS_VideoMode::VESA); break;
 
-						case 0x2A: mode = "VESA 800x600 @ 56.250"; gsSetVideoMode(GS_VideoMode::VESA); break;
-						case 0x2B: mode = "VESA 800x600 @ 60.317"; gsSetVideoMode(GS_VideoMode::VESA); break;
-						case 0x2C: mode = "VESA 800x600 @ 72.188"; gsSetVideoMode(GS_VideoMode::VESA); break;
-						case 0x2D: mode = "VESA 800x600 @ 75.000"; gsSetVideoMode(GS_VideoMode::VESA); break;
-						case 0x2E: mode = "VESA 800x600 @ 85.061"; gsSetVideoMode(GS_VideoMode::VESA); break;
+				case 0x2A: mode = "VESA 800x600 @ 56.250"; gsSetVideoMode(GS_VideoMode::VESA); break;
+				case 0x2B: mode = "VESA 800x600 @ 60.317"; gsSetVideoMode(GS_VideoMode::VESA); break;
+				case 0x2C: mode = "VESA 800x600 @ 72.188"; gsSetVideoMode(GS_VideoMode::VESA); break;
+				case 0x2D: mode = "VESA 800x600 @ 75.000"; gsSetVideoMode(GS_VideoMode::VESA); break;
+				case 0x2E: mode = "VESA 800x600 @ 85.061"; gsSetVideoMode(GS_VideoMode::VESA); break;
 
-						case 0x3B: mode = "VESA 1024x768 @ 60.004"; gsSetVideoMode(GS_VideoMode::VESA); break;
-						case 0x3C: mode = "VESA 1024x768 @ 70.069"; gsSetVideoMode(GS_VideoMode::VESA); break;
-						case 0x3D: mode = "VESA 1024x768 @ 75.029"; gsSetVideoMode(GS_VideoMode::VESA); break;
-						case 0x3E: mode = "VESA 1024x768 @ 84.997"; gsSetVideoMode(GS_VideoMode::VESA); break;
+				case 0x3B: mode = "VESA 1024x768 @ 60.004"; gsSetVideoMode(GS_VideoMode::VESA); break;
+				case 0x3C: mode = "VESA 1024x768 @ 70.069"; gsSetVideoMode(GS_VideoMode::VESA); break;
+				case 0x3D: mode = "VESA 1024x768 @ 75.029"; gsSetVideoMode(GS_VideoMode::VESA); break;
+				case 0x3E: mode = "VESA 1024x768 @ 84.997"; gsSetVideoMode(GS_VideoMode::VESA); break;
 
-						case 0x4A: mode = "VESA 1280x1024 @ 63.981"; gsSetVideoMode(GS_VideoMode::VESA); break;
-						case 0x4B: mode = "VESA 1280x1024 @ 79.976"; gsSetVideoMode(GS_VideoMode::VESA); break;
+				case 0x4A: mode = "VESA 1280x1024 @ 63.981"; gsSetVideoMode(GS_VideoMode::VESA); break;
+				case 0x4B: mode = "VESA 1280x1024 @ 79.976"; gsSetVideoMode(GS_VideoMode::VESA); break;
 
-						case 0x50: mode = "SDTV   720x480 @ 59.94"; gsSetVideoMode(GS_VideoMode::SDTV_480P); break;
-						case 0x51: mode = "HDTV 1920x1080 @ 60.00"; gsSetVideoMode(GS_VideoMode::HDTV_1080I); break;
-						case 0x52: mode = "HDTV  1280x720 @ ??.???"; gsSetVideoMode(GS_VideoMode::HDTV_720P); break;
-						case 0x53: mode = "SDTV   768x576 @ ??.???"; gsSetVideoMode(GS_VideoMode::SDTV_576P); break;
-						case 0x54: mode = "HDTV 1920x1080 @ ??.???"; gsSetVideoMode(GS_VideoMode::HDTV_1080P); break;
+				case 0x50: mode = "SDTV   720x480 @ 59.94"; gsSetVideoMode(GS_VideoMode::SDTV_480P); break;
+				case 0x51: mode = "HDTV 1920x1080 @ 60.00"; gsSetVideoMode(GS_VideoMode::HDTV_1080I); break;
+				case 0x52: mode = "HDTV  1280x720 @ ??.???"; gsSetVideoMode(GS_VideoMode::HDTV_720P); break;
+				case 0x53: mode = "SDTV   768x576 @ ??.???"; gsSetVideoMode(GS_VideoMode::SDTV_576P); break;
+				case 0x54: mode = "HDTV 1920x1080 @ ??.???"; gsSetVideoMode(GS_VideoMode::HDTV_1080P); break;
 
-						case 0x72: mode = "DVD NTSC 640x448 @ ??.???"; gsSetVideoMode(GS_VideoMode::DVD_NTSC); break;
-						case 0x73: mode = "DVD PAL 720x480 @ ??.???"; gsSetVideoMode(GS_VideoMode::DVD_PAL); break;
+				case 0x72:
+				case 0x82:
+					mode = "DVD NTSC 640x448 @ ??.???"; gsSetVideoMode(GS_VideoMode::DVD_NTSC); break;
+				case 0x73:
+				case 0x83:
+					mode = "DVD PAL 720x480 @ ??.???"; gsSetVideoMode(GS_VideoMode::DVD_PAL); break;
 
-						default:
-							DevCon.Error("Mode %x is not supported. Report me upstream", cpuRegs.GPR.n.a1.UC[0]);
-							gsSetVideoMode(GS_VideoMode::Unknown);
-					}
-					DevCon.Warning("Set GS CRTC configuration. Interlace %s. Field Type %s. Mode %s", inter, field, mode.c_str());
+				default:
+					DevCon.Error("Mode %x is not supported. Report me upstream", cpuRegs.GPR.n.a1.UC[0]);
+					gsSetVideoMode(GS_VideoMode::Unknown);
+			}
+			DevCon.Warning("Set GS CRTC configuration. %s %s (%s)",mode.c_str(), inter, field);
+		}
+		break;
+		case Syscall::ExecPS2:
+		{
+			if (DebugInterface::getPauseOnEntry())
+			{
+				CBreakPoints::AddBreakPoint(BREAKPOINT_EE, cpuRegs.GPR.n.a0.UL[0], true);
+				DebugInterface::setPauseOnEntry(false);
+			}
+		}
+		break;
+		case Syscall::RFU060:
+			if (CHECK_EXTRAMEM && cpuRegs.GPR.n.a1.UL[0] == 0xFFFFFFFF)
+			{
+				cpuRegs.GPR.n.a1.UL[0] = Ps2MemSize::ExposedRam - cpuRegs.GPR.n.a2.SL[0];
+			}
+			break;
+		case Syscall::SetOsdConfigParam:
+			// The whole thing gets written back to BIOS memory, so it'll be in the right place, no need to continue HLEing
+			AllowParams1 = true;
+			break;
+		case Syscall::GetOsdConfigParam:
+			if (!NoOSD && !AllowParams1)
+			{
+				ReadOSDConfigParames();
+
+				u32 memaddr = cpuRegs.GPR.n.a0.UL[0];
+
+				memWrite32(memaddr, configParams1.UL[0]);
+				
+				// Call the set function, as we need to set this back to the BIOS storage position.
+				if (cpuRegs.GPR.n.v1.SL[0] < 0)
+					cpuRegs.GPR.n.v1.SL[0] = -Syscall::SetOsdConfigParam;
+				else
+					cpuRegs.GPR.n.v1.UC[0] = Syscall::SetOsdConfigParam;
+
+				AllowParams1 = true;
+			}
+			break;
+		case Syscall::SetOsdConfigParam2:
+			if (!AllowParams2)
+			{
+				ReadOSDConfigParames();
+
+				u32 memaddr = cpuRegs.GPR.n.a0.UL[0];
+				u32 size = cpuRegs.GPR.n.a1.UL[0];
+				u32 offset = cpuRegs.GPR.n.a2.UL[0];
+
+				if (offset == 0 && size >= 4)
+					AllowParams2 = true;
+
+				for (u32 i = 0; i < size; i++)
+				{
+					if (offset >= 4)
+						break;
+
+					configParams2.UC[offset++] = memRead8(memaddr++);
 				}
-				break;
+			}
+			break;
+		case Syscall::GetOsdConfigParam2:
+			if (!NoOSD && !AllowParams2)
+			{
+				ReadOSDConfigParames();
 
+				u32 memaddr = cpuRegs.GPR.n.a0.UL[0];
+				u32 size = cpuRegs.GPR.n.a1.UL[0];
+				u32 offset = cpuRegs.GPR.n.a2.UL[0];
+
+				if (offset + size > 2)
+					Console.Warning("Warning: GetOsdConfigParam2 Reading extended language/version configs, may be incorrect!");
+
+				for (u32 i = 0; i < size; i++)
+				{
+					if (offset >= 4)
+						memWrite8(memaddr++, 0);
+					else
+						memWrite8(memaddr++, configParams2.UC[offset++]);
+				}
+				return;
+			}
+			break;
 		case Syscall::SetVTLBRefillHandler:
 			DevCon.Warning("A tlb refill handler is set. New handler %x", (u32*)PSM(cpuRegs.GPR.n.a1.UL[0]));
 			break;
+		case Syscall::StartThread:
+		case Syscall::ChangeThreadPriority:
+		{
+			if (CurrentBiosInformation.eeThreadListAddr == 0)
+			{
+				u32 offset = 0x0;
+				// Suprisingly not that slow :)
+				while (offset < 0x5000) // I find that the instructions are in between 0x4000 -> 0x5000
+				{
+					u32 addr = 0x80000000 + offset;
+					const u32 inst1 = memRead32(addr);
+					const u32 inst2 = memRead32(addr += 4);
+					const u32 inst3 = memRead32(addr += 4);
 
-
+					if (ThreadListInstructions[0] == inst1 && // sw v0,0x0(v0)
+						ThreadListInstructions[1] == inst2 && // no-op
+						ThreadListInstructions[2] == inst3) // no-op
+					{
+						// We've found the instruction pattern!
+						// We (well, I) know that the thread address is always 0x8001 + the immediate of the 6th instruction from here
+						const u32 op = memRead32(0x80000000 + offset + (sizeof(u32) * 6));
+						CurrentBiosInformation.eeThreadListAddr = 0x80010000 + static_cast<u16>(op) - 8; // Subtract 8 because the address here is offset by 8.
+						DevCon.WriteLn("BIOS: Successfully found the instruction pattern. Assuming the thread list is here: %0x", CurrentBiosInformation.eeThreadListAddr);
+						break;
+					}
+					offset += 4;
+				}
+				if (!CurrentBiosInformation.eeThreadListAddr)
+				{
+					// We couldn't find the address
+					CurrentBiosInformation.eeThreadListAddr = -1;
+					// If you're here because a user has reported this message, this means that the instruction pattern is not present on their bios, or it is aligned weirdly.
+					Console.Warning("BIOS Warning: Unable to get a thread list offset. The debugger thread and stack frame views will not be functional.");
+				}
+			}
+		}
+		break;
 		case Syscall::sceSifSetDma:
 			// The only thing this code is used for is the one log message, so don't execute it if we aren't logging bios messages.
-			if (SysTraceActive(EE.Bios))
+			if (TraceActive(EE.Bios))
 			{
-				t_sif_dma_transfer *dmat;
 				//struct t_sif_cmd_header	*hdr;
 				//struct t_sif_rpc_bind *bind;
 				//struct t_rpc_server_data *server;
@@ -964,7 +1116,7 @@ void SYSCALL()
 				if (n_transfer >= 0)
 				{
 					addr = cpuRegs.GPR.n.a0.UL[0] + n_transfer * sizeof(t_sif_dma_transfer);
-					dmat = (t_sif_dma_transfer*)PSM(addr);
+					t_sif_dma_transfer* dmat = (t_sif_dma_transfer*)PSM(addr);
 
 					BIOS_LOG("bios_%s: n_transfer=%d, size=%x, attr=%x, dest=%x, src=%x",
 							R5900::bios[cpuRegs.GPR.n.v1.UC[0]], n_transfer,
@@ -991,20 +1143,61 @@ void SYSCALL()
 			{
 				// TODO: Only supports 7 format arguments. Need to read from the stack for more.
 				// Is there a function which collects PS2 arguments?
-				sysConLog(
-					ShiftJIS_ConvertString((char*)PSM(cpuRegs.GPR.n.a0.UL[0])),
+				char* fmt = (char*)PSM(cpuRegs.GPR.n.a0.UL[0]);
+
+				u64 regs[7] = {
 					cpuRegs.GPR.n.a1.UL[0],
 					cpuRegs.GPR.n.a2.UL[0],
 					cpuRegs.GPR.n.a3.UL[0],
 					cpuRegs.GPR.n.t0.UL[0],
 					cpuRegs.GPR.n.t1.UL[0],
 					cpuRegs.GPR.n.t2.UL[0],
-					cpuRegs.GPR.n.t3.UL[0]
+					cpuRegs.GPR.n.t3.UL[0],
+				};
+
+				// Pretty much what this does is find instances of string arguments and remaps them.
+				// Instead of the addresse(s) being relative to the PS2 address space, make them relative to program memory.
+				// (This fixes issue #2865)
+				int curRegArg = 0;
+				for (int i = 0; 1; i++)
+				{
+					if (fmt[i] == '\0')
+						break;
+
+					if (fmt[i] == '%')
+					{
+						// The extra check here is to be compatible with "%%s"
+						if (i == 0 || fmt[i - 1] != '%') {
+							if (fmt[i + 1] == 's') {
+								regs[curRegArg] = (u64)PSM(regs[curRegArg]); // PS2 Address -> PCSX2 Address
+							}
+							curRegArg++;
+						}
+					}
+				}
+				char buf[2048];
+				snprintf(buf, sizeof(buf), fmt,
+					regs[0],
+					regs[1],
+					regs[2],
+					regs[3],
+					regs[4],
+					regs[5],
+					regs[6]
 				);
+
+				eeConLog(buf);
 			}
 			break;
 		}
-		
+		case Syscall::GetMemorySize:
+			if (CHECK_EXTRAMEM)
+			{
+				cpuRegs.GPR.n.v0.UL[0] = Ps2MemSize::ExposedRam;
+				return;
+			}
+			break;
+
 
 		default:
 			break;
@@ -1045,9 +1238,6 @@ void PREF()
 
 static void trap(u16 code=0)
 {
-	// unimplemented?
-	// throw R5900Exception::Trap(code);
-
 	cpuRegs.pc -= 4;
 	Console.Warning("Trap exception at 0x%08x", cpuRegs.pc);
 	cpuException(0x34, cpuRegs.branch);

@@ -1,23 +1,16 @@
 ////////////////////////////////////////////////////////////////////////////////
 ///
-/// Sampled sound tempo changer/time stretch algorithm. Changes the sound tempo 
-/// while maintaining the original pitch by using a time domain WSOLA-like method 
+/// Sampled sound tempo changer/time stretch algorithm. Changes the sound tempo
+/// while maintaining the original pitch by using a time domain WSOLA-like method
 /// with several performance-increasing tweaks.
 ///
-/// Anti-alias filter is used to prevent folding of high frequencies when 
+/// Anti-alias filter is used to prevent folding of high frequencies when
 /// transposing the sample rate with interpolation.
 ///
 /// Author        : Copyright (c) Olli Parviainen
 /// Author e-mail : oparviai 'at' iki.fi
 /// SoundTouch WWW: http://www.surina.net/soundtouch
 ///
-////////////////////////////////////////////////////////////////////////////////
-//
-// Last changed  : $Date: 2014-01-07 21:41:23 +0200 (ti, 07 tammi 2014) $
-// File revision : $Revision: 4 $
-//
-// $Id: AAFilter.h 187 2014-01-07 19:41:23Z oparviai $
-//
 ////////////////////////////////////////////////////////////////////////////////
 //
 // License :
@@ -68,8 +61,8 @@ public:
 
     ~AAFilter();
 
-    /// Sets new anti-alias filter cut-off edge frequency, scaled to sampling 
-    /// frequency (nyquist frequency = 0.5). The filter will cut off the 
+    /// Sets new anti-alias filter cut-off edge frequency, scaled to sampling
+    /// frequency (nyquist frequency = 0.5). The filter will cut off the
     /// frequencies than that.
     void setCutoffFreq(double newCutoffFreq);
 
@@ -78,19 +71,19 @@ public:
 
     uint getLength() const;
 
-    /// Applies the filter to the given sequence of samples. 
-    /// Note : The amount of outputted samples is by value of 'filter length' 
+    /// Applies the filter to the given sequence of samples.
+    /// Note : The amount of outputted samples is by value of 'filter length'
     /// smaller than the amount of input samples.
-    uint evaluate(SAMPLETYPE *dest, 
-                  const SAMPLETYPE *src, 
-                  uint numSamples, 
+    uint evaluate(SAMPLETYPE *dest,
+                  const SAMPLETYPE *src,
+                  uint numSamples,
                   uint numChannels) const;
 
     /// Applies the filter to the given src & dest pipes, so that processed amount of
-    /// samples get removed from src, and produced amount added to dest 
-    /// Note : The amount of outputted samples is by value of 'filter length' 
+    /// samples get removed from src, and produced amount added to dest
+    /// Note : The amount of outputted samples is by value of 'filter length'
     /// smaller than the amount of input samples.
-    uint evaluate(FIFOSampleBuffer &dest, 
+    uint evaluate(FIFOSampleBuffer &dest,
                   FIFOSampleBuffer &src) const;
 
 };

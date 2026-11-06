@@ -1,32 +1,13 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
-
-
-// recompiler reworked to add dynamic linking zerofrog(@gmail.com) Jan06
-
-#include "PrecompiledHeader.h"
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
 #include "Common.h"
 #include "R5900OpcodeTables.h"
-#include "iR5900.h"
+#include "x86/iR5900.h"
 
 using namespace x86Emitter;
 
-namespace R5900 {
-namespace Dynarec {
-namespace OpcodeImpl
+namespace R5900::Dynarec::OpcodeImpl
 {
 
 /*********************************************************
@@ -50,8 +31,8 @@ void recJ()
 	EE::Profiler.EmitOp(eeOpcode::J);
 
 	// SET_FPUSTATE;
-	u32 newpc = (_Target_ << 2) + ( pc & 0xf0000000 );
-	recompileNextInstruction(1);
+	u32 newpc = (_InstrucTarget_ << 2) + (pc & 0xf0000000);
+	recompileNextInstruction(true, false);
 	if (EmuConfig.Gamefixes.GoemonTlbHack)
 		SetBranchImm(vtlb_V2P(newpc));
 	else
@@ -63,9 +44,9 @@ void recJAL()
 {
 	EE::Profiler.EmitOp(eeOpcode::JAL);
 
-	u32 newpc = (_Target_ << 2) + ( pc & 0xf0000000 );
+	u32 newpc = (_InstrucTarget_ << 2) + (pc & 0xf0000000);
 	_deleteEEreg(31, 0);
-	if(EE_CONST_PROP)
+	if (EE_CONST_PROP)
 	{
 		GPR_SET_CONST(31);
 		g_cpuConstRegs[31].UL[0] = pc + 4;
@@ -77,7 +58,7 @@ void recJAL()
 		xMOV(ptr32[&cpuRegs.GPR.r[31].UL[1]], 0);
 	}
 
-	recompileNextInstruction(1);
+	recompileNextInstruction(true, false);
 	if (EmuConfig.Gamefixes.GoemonTlbHack)
 		SetBranchImm(vtlb_V2P(newpc));
 	else
@@ -94,7 +75,48 @@ void recJR()
 {
 	EE::Profiler.EmitOp(eeOpcode::JR);
 
-	SetBranchReg( _Rs_);
+	const bool swap = EmuConfig.Gamefixes.GoemonTlbHack ? false : TrySwapDelaySlot(_Rs_, 0, 0, true);
+	if (!swap)
+	{
+		const int wbreg = _allocX86reg(X86TYPE_PCWRITEBACK, 0, MODE_WRITE | MODE_CALLEESAVED);
+		_eeMoveGPRtoR(xRegister32(wbreg), _Rs_);
+
+		if (EmuConfig.Gamefixes.GoemonTlbHack)
+		{
+			xMOV(ecx, xRegister32(wbreg));
+			vtlb_DynV2P();
+			xMOV(xRegister32(wbreg), eax);
+		}
+
+		recompileNextInstruction(true, false);
+
+		// the next instruction may have flushed the register.. so reload it if so.
+		if (x86regs[wbreg].inuse && x86regs[wbreg].type == X86TYPE_PCWRITEBACK)
+		{
+			xMOV(eax, xRegister32(wbreg));
+			x86regs[wbreg].inuse = 0;
+		}
+		else
+		{
+			xMOV(eax, ptr[&cpuRegs.pcWriteback]);
+		}
+	}
+	else
+	{
+		if (GPR_IS_DIRTY_CONST(_Rs_) || _hasX86reg(X86TYPE_GPR, _Rs_, 0))
+		{
+			const int x86reg = _allocX86reg(X86TYPE_GPR, _Rs_, MODE_READ);
+			xMOV(eax, xRegister32(x86reg));
+		}
+		else
+		{
+			_eeMoveGPRtoR(eax, _Rs_);
+		}
+	}
+
+
+	// Target passed in eax
+	SetBranchReg();
 }
 
 ////////////////////////////////////////////////////
@@ -102,64 +124,70 @@ void recJALR()
 {
 	EE::Profiler.EmitOp(eeOpcode::JALR);
 
-	int newpc = pc + 4;
-	_allocX86reg(esi, X86TYPE_PCWRITEBACK, 0, MODE_WRITE);
-	_eeMoveGPRtoR(esi, _Rs_);
+	const u32 newpc = pc + 4;
+	const bool swap = (EmuConfig.Gamefixes.GoemonTlbHack || _Rd_ == _Rs_) ? false : TrySwapDelaySlot(_Rs_, 0, _Rd_, true);
 
-	if (EmuConfig.Gamefixes.GoemonTlbHack) {
-		xMOV(ecx, esi);
-		vtlb_DynV2P();
-		xMOV(esi, eax);
+
+	int wbreg = -1;
+	if (!swap)
+	{
+		wbreg = _allocX86reg(X86TYPE_PCWRITEBACK, 0, MODE_WRITE | MODE_CALLEESAVED);
+		_eeMoveGPRtoR(xRegister32(wbreg), _Rs_);
+
+		if (EmuConfig.Gamefixes.GoemonTlbHack)
+		{
+			xMOV(ecx, xRegister32(wbreg));
+			vtlb_DynV2P();
+			xMOV(xRegister32(wbreg), eax);
+		}
 	}
-	// uncomment when there are NO instructions that need to call interpreter
-//	int mmreg;
-//	if( GPR_IS_CONST1(_Rs_) )
-//		xMOV(ptr32[&cpuRegs.pc], g_cpuConstRegs[_Rs_].UL[0] );
-//	else {
-//		int mmreg;
-//
-//		if( (mmreg = _checkXMMreg(XMMTYPE_GPRREG, _Rs_, MODE_READ)) >= 0 ) {
-//			xMOVSS(ptr[&cpuRegs.pc], xRegisterSSE(mmreg));
-//		}
-//		else {
-//			xMOV(eax, ptr[(void*)((int)&cpuRegs.GPR.r[ _Rs_ ].UL[ 0 ] )]);
-//			xMOV(ptr[&cpuRegs.pc], eax);
-//		}
-//	}
 
-	
-	if ( _Rd_ )
+	if (_Rd_)
 	{
 		_deleteEEreg(_Rd_, 0);
-		if(EE_CONST_PROP)
+		if (EE_CONST_PROP)
 		{
 			GPR_SET_CONST(_Rd_);
-			g_cpuConstRegs[_Rd_].UL[0] = newpc;
-			g_cpuConstRegs[_Rd_].UL[1] = 0;
+			g_cpuConstRegs[_Rd_].UD[0] = newpc;
 		}
 		else
 		{
-			xMOV(ptr32[&cpuRegs.GPR.r[_Rd_].UL[0]], newpc);
-			xMOV(ptr32[&cpuRegs.GPR.r[_Rd_].UL[1]], 0);
+			xWriteImm64ToMem(&cpuRegs.GPR.r[_Rd_].UD[0], rax, newpc);
 		}
 	}
 
-	_clearNeededXMMregs();
-	recompileNextInstruction(1);
+	if (!swap)
+	{
+		recompileNextInstruction(true, false);
 
-	if( x86regs[esi.GetId()].inuse ) {
-		pxAssert( x86regs[esi.GetId()].type == X86TYPE_PCWRITEBACK );
-		xMOV(ptr[&cpuRegs.pc], esi);
-		x86regs[esi.GetId()].inuse = 0;
+		// the next instruction may have flushed the register.. so reload it if so.
+		if (x86regs[wbreg].inuse && x86regs[wbreg].type == X86TYPE_PCWRITEBACK)
+		{
+			xMOV(eax, xRegister32(wbreg));
+			x86regs[wbreg].inuse = 0;
+		}
+		else
+		{
+			xMOV(eax, ptr[&cpuRegs.pcWriteback]);
+		}
 	}
-	else {
-		xMOV(eax, ptr[&g_recWriteback]);
-		xMOV(ptr[&cpuRegs.pc], eax);
+	else
+	{
+		if (GPR_IS_DIRTY_CONST(_Rs_) || _hasX86reg(X86TYPE_GPR, _Rs_, 0))
+		{
+			const int x86reg = _allocX86reg(X86TYPE_GPR, _Rs_, MODE_READ);
+			xMOV(eax, xRegister32(x86reg));
+		}
+		else
+		{
+			_eeMoveGPRtoR(eax, _Rs_);
+		}
 	}
 
-	SetBranchReg(0xffffffff);
+	// Target passed in eax
+	SetBranchReg();
 }
 
 #endif
 
-} } }
+} // namespace R5900::Dynarec::OpcodeImpl

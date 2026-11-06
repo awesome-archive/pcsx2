@@ -1,21 +1,12 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
 #pragma once
 
-#include "IopCommon.h"
+#include "Common.h"
+#include "IopHw.h"
+
+#include "fmt/format.h"
 
 namespace IopMemory {
 namespace Internal {
@@ -67,8 +58,8 @@ static __ri const char* _ioplog_GetHwName( u32 addr, T val )
 		// ------------------------------------------------------------------------
 		case 0x1f801060:return "RAM_SIZE";
 
-		case HW_IREG:	return "IREG";
-		case HW_IREG+2:	return "IREG_hi";
+		case HW_ISTAT:	return "ISTAT";
+		case HW_ISTAT+2:	return "ISTAT_hi";
 		case HW_IMASK:	return "IMASK";
 		case HW_IMASK+2:return "IMASK_hi";
 		case HW_ICTRL:	return "ICTRL";
@@ -145,14 +136,14 @@ static __ri const char* _ioplog_GetHwName( u32 addr, T val )
 
 		// ------------------------------------------------------------------------
 
-		case HW_SIO2_FIFO:	return "SIO2 FIFO";
-		case HW_SIO2_CTRL:	return "SIO2 CTRL";
-		case HW_SIO2_RECV1:	return "SIO2 RECV1";
-		case HW_SIO2_RECV2:	return "SIO2 RECV2";
-		case HW_SIO2_RECV3:	return "SIO2 RECV3";
-		case HW_SIO2_INTR:	return "SIO2 INTR";
-		case 0x1f808278:	return "SIO2 8278";
-		case 0x1f80827C:	return "SIO2 827C";
+		case HW_SIO2_RX:	    return "SIO2 RX";
+		case HW_SIO2_CTRL:	    return "SIO2 CTRL";
+		case HW_SIO2_CMD_STAT:	return "SIO2 CMD_STAT";
+		case HW_SIO2_PORT_STAT:	return "SIO2 PORT_STAT";
+		case HW_SIO2_FIFO_STAT:	return "SIO2 FIFO_STAT";
+		case HW_SIO2_INTR:	    return "SIO2 INTR";
+		case HW_SIO2_FIFO_TX:   return "SIO2 FIFO_TX";
+		case HW_SIO2_FIFO_RX:   return "SIO2 FIFO_RX";
 
 		// ------------------------------------------------------------------------
 		// Check for "zoned" registers in the default case.
@@ -170,7 +161,7 @@ static __ri const char* _ioplog_GetHwName( u32 addr, T val )
 					default: return "Invalid Counter";
 				}
 			}
-			else if( addr >= 0x1f801480 && addr < 0x1f8014b0 )
+			else if ( addr >= 0x1f801480 && addr < 0x1f8014b0 )
 			{
 				switch( addr & 0xf )
 				{
@@ -183,20 +174,20 @@ static __ri const char* _ioplog_GetHwName( u32 addr, T val )
 					default: return "Invalid Counter";
 				}
 			}
-			else if( (addr >= HW_USB_START) && (addr < HW_USB_END) )
+			else if ( (addr >= HW_USB_START) && (addr < HW_USB_END) )
 			{
 				return "USB";
 			}
-			else if( (addr >= HW_SPU2_START) && (addr < HW_SPU2_END) )
+			else if ( (addr >= HW_SPU2_START) && (addr < HW_SPU2_END) )
 			{
 				return "SPU2";
 			}
-			else if( addr >= pgmsk(HW_FW_START) && addr <= pgmsk(HW_FW_END) )
+			else if ( addr >= pgmsk(HW_FW_START) && addr <= pgmsk(HW_FW_END) )
 			{
 				return "FW";
 			}
-			else if( addr >= 0x1f808200 && addr < 0x1f808240 ) { return "SIO2 param"; }
-			else if( addr >= 0x1f808240 && addr < 0x1f808260 ) { return "SIO2 send"; }
+			else if ( addr >= 0x1f808200 && addr < 0x1f808240 ) { return "SIO2 param"; }
+			else if ( addr >= 0x1f808240 && addr < 0x1f808260 ) { return "SIO2 send"; }
 
 		return NULL; //"Unknown";
 	}
@@ -206,20 +197,30 @@ template< typename T>
 static __ri void IopHwTraceLog( u32 addr, T val, bool mode )
 {
 	if (!IsDevBuild) return;
-	if (!EmuConfig.Trace.Enabled || !EmuConfig.Trace.IOP.m_EnableAll || !EmuConfig.Trace.IOP.m_EnableRegisters) return;
+	if (!EmuConfig.Trace.Enabled) return;
 
-	FastFormatAscii valStr;
-	FastFormatAscii labelStr;
-	labelStr.Write("Hw%s%u", mode ? "Read" : "Write", sizeof (T) * 8);
+	std::string labelStr(fmt::format("Hw{}{}", mode ? "Read" : "Write", sizeof(T) * 8));
+	std::string valStr;
 
-	switch( sizeof (T) )
+	if constexpr (sizeof(T) == 1)
 	{
-		case 1: valStr.Write("0x%02x", val); break;
-		case 2: valStr.Write("0x%04x", val); break;
-		case 4: valStr.Write("0x%08x", val); break;
-
-		case 8: valStr.Write("0x%08x.%08x", ((u32*)&val)[1], ((u32*)&val)[0]); break;
-		case 16: ((u128&)val).WriteTo(valStr);
+		valStr = fmt::format("0x{:02x}", val);
+	}
+	else if constexpr (sizeof(T) == 2)
+	{
+		valStr = fmt::format("0x{:04x}", val);
+	}
+	else if constexpr (sizeof(T) == 4)
+	{
+		valStr = fmt::format("0x{:08x}", val);
+	}
+	else if constexpr (sizeof(T) == 8)
+	{
+		valStr = fmt::format("0x{:08x}.{:08x}", ((u32*)&val)[1], ((u32*)&val)[0]);
+	}
+	else if constexpr (sizeof(T) == 16)
+	{
+		valStr = StringUtil::U128ToString((u128&)val);
 	}
 
 	static const char* temp = "%-12s @ 0x%08X/%-16s %s %s";

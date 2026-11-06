@@ -1,22 +1,15 @@
 ////////////////////////////////////////////////////////////////////////////////
 ///
 /// FIR low-pass (anti-alias) filter with filter coefficient design routine and
-/// MMX optimization. 
-/// 
-/// Anti-alias filter is used to prevent folding of high frequencies when 
+/// MMX optimization.
+///
+/// Anti-alias filter is used to prevent folding of high frequencies when
 /// transposing the sample rate with interpolation.
 ///
 /// Author        : Copyright (c) Olli Parviainen
 /// Author e-mail : oparviai 'at' iki.fi
 /// SoundTouch WWW: http://www.surina.net/soundtouch
 ///
-////////////////////////////////////////////////////////////////////////////////
-//
-// Last changed  : $Date: 2016-01-12 19:26:21 +0200 (ti, 12 tammi 2016) $
-// File revision : $Revision: 4 $
-//
-// $Id: AAFilter.cpp 240 2016-01-12 17:26:21Z oparviai $
-//
 ////////////////////////////////////////////////////////////////////////////////
 //
 // License :
@@ -61,7 +54,7 @@ using namespace soundtouch;
     static void _DEBUG_SAVE_AAFIR_COEFFS(SAMPLETYPE *coeffs, int len)
     {
         FILE *fptr = fopen("aa_filter_coeffs.txt", "wt");
-        if (fptr == NULL) return;
+        if (fptr == nullptr) return;
 
         for (int i = 0; i < len; i ++)
         {
@@ -74,7 +67,6 @@ using namespace soundtouch;
 #else
     #define _DEBUG_SAVE_AAFIR_COEFFS(x, y)
 #endif
-
 
 /*****************************************************************************
  *
@@ -90,12 +82,10 @@ AAFilter::AAFilter(uint len)
 }
 
 
-
 AAFilter::~AAFilter()
 {
     delete pFIR;
 }
-
 
 
 // Sets new anti-alias filter cut-off edge frequency, scaled to
@@ -108,14 +98,12 @@ void AAFilter::setCutoffFreq(double newCutoffFreq)
 }
 
 
-
 // Sets number of FIR filter taps
 void AAFilter::setLength(uint newLength)
 {
     length = newLength;
     calculateCoeffs();
 }
-
 
 
 // Calculates coefficients for a low-pass FIR filter using Hamming window
@@ -140,16 +128,16 @@ void AAFilter::calculateCoeffs()
     tempCoeff = TWOPI / (double)length;
 
     sum = 0;
-    for (i = 0; i < length; i ++) 
+    for (i = 0; i < length; i ++)
     {
         cntTemp = (double)i - (double)(length / 2);
 
         temp = cntTemp * wc;
-        if (temp != 0) 
+        if (temp != 0)
         {
             h = sin(temp) / temp;                     // sinc function
-        } 
-        else 
+        }
+        else
         {
             h = 1.0;
         }
@@ -158,7 +146,7 @@ void AAFilter::calculateCoeffs()
         temp = w * h;
         work[i] = temp;
 
-        // calc net sum of coefficients 
+        // calc net sum of coefficients
         sum += temp;
     }
 
@@ -174,15 +162,13 @@ void AAFilter::calculateCoeffs()
     // divided by 16384
     scaleCoeff = 16384.0f / sum;
 
-    for (i = 0; i < length; i ++) 
+    for (i = 0; i < length; i ++)
     {
         temp = work[i] * scaleCoeff;
-//#if SOUNDTOUCH_INTEGER_SAMPLES
         // scale & round to nearest integer
         temp += (temp >= 0) ? 0.5 : -0.5;
         // ensure no overfloods
         assert(temp >= -32768 && temp <= 32767);
-//#endif
         coeffs[i] = (SAMPLETYPE)temp;
     }
 
@@ -196,8 +182,8 @@ void AAFilter::calculateCoeffs()
 }
 
 
-// Applies the filter to the given sequence of samples. 
-// Note : The amount of outputted samples is by value of 'filter length' 
+// Applies the filter to the given sequence of samples.
+// Note : The amount of outputted samples is by value of 'filter length'
 // smaller than the amount of input samples.
 uint AAFilter::evaluate(SAMPLETYPE *dest, const SAMPLETYPE *src, uint numSamples, uint numChannels) const
 {
@@ -206,8 +192,8 @@ uint AAFilter::evaluate(SAMPLETYPE *dest, const SAMPLETYPE *src, uint numSamples
 
 
 /// Applies the filter to the given src & dest pipes, so that processed amount of
-/// samples get removed from src, and produced amount added to dest 
-/// Note : The amount of outputted samples is by value of 'filter length' 
+/// samples get removed from src, and produced amount added to dest
+/// Note : The amount of outputted samples is by value of 'filter length'
 /// smaller than the amount of input samples.
 uint AAFilter::evaluate(FIFOSampleBuffer &dest, FIFOSampleBuffer &src) const
 {

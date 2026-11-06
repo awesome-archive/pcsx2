@@ -1,22 +1,6 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
-
-#include "PrecompiledHeader.h"
-
-#include "IopCommon.h"
 #include "VUmicro.h"
 #include "deci2.h"
 
@@ -106,7 +90,6 @@ void D2_DBGP(const u8 *inbuffer, u8 *outbuffer, char *message, char *eepc, char 
 	const DECI2_DBGP_RUN*run  =(DECI2_DBGP_RUN*) &in[1];
 
 	static char line[1024];
-	int i, s;
 
 	memcpy(outbuffer, inbuffer, 128*1024);//BUFFERSIZE
 	//out->h.length=sizeof(DECI2_DBGP_HEADER);
@@ -133,7 +116,7 @@ void D2_DBGP(const u8 *inbuffer, u8 *outbuffer, char *message, char *eepc, char 
             sprintf(line, "%s/GETREG count=%d kind[0]=%d number[0]=%d",
 				in->id==0?"CPU":in->id==1?"VU0":"VU1", in->count, eregs[0].kind, eregs[0].number);
 			if (in->h.destination=='I'){
-				for (i=0; i<in->count; i++)
+				for (int i=0; i<in->count; i++)
 					switch (iregs[i].kind){
 					case 1:switch (iregs[i].number){
 							case 0:iregs[i].value=psxRegs.GPR.n.lo;break;
@@ -151,7 +134,7 @@ void D2_DBGP(const u8 *inbuffer, u8 *outbuffer, char *message, char *eepc, char 
 						iregs[0].value++;//dummy; might be assert(0)
 					}
 			}else
-				for (i=0; i<in->count; i++)
+				for (int i=0; i<in->count; i++)
 					switch (eregs[i].kind){
 					case  0:memcpy(eregs[i].value, &cpuRegs.GPR.r[eregs[i].number], 16);break;
 					case  1:
@@ -182,7 +165,7 @@ void D2_DBGP(const u8 *inbuffer, u8 *outbuffer, char *message, char *eepc, char 
             sprintf(line, "%s/PUTREG count=%d kind[0]=%d number[0]=%d value=%016I64X_%016I64X",
 				in->id==0?"CPU":in->id==1?"VU0":"VU1", in->count, eregs[0].kind, eregs[0].number, eregs[0].value[1], eregs[0].value[0]);
 			if (in->h.destination=='I'){
-				for (i=0; i<in->count; i++)
+				for (int i=0; i<in->count; i++)
 					switch (iregs[i].kind){
 					case 1:switch (iregs[i].number){
 							case 0:psxRegs.GPR.n.lo=iregs[i].value;break;
@@ -200,7 +183,7 @@ void D2_DBGP(const u8 *inbuffer, u8 *outbuffer, char *message, char *eepc, char 
 						;//dummy; might be assert(0)
 					}
 			}else
-				for (i=0; i<in->count; i++)
+				for (int i=0; i<in->count; i++)
 					switch (eregs[i].kind){
 					case  0:memcpy(&cpuRegs.GPR.r[eregs[i].number], eregs[i].value, 16);break;
 					case  1:
@@ -389,7 +372,8 @@ void D2_DBGP(const u8 *inbuffer, u8 *outbuffer, char *message, char *eepc, char 
 			cpuRegs.GPR.n.gp.UL[0]=run->gp;
 //			threads_array[0].argc = run->argc;
 			u32* argv = (u32*)&run[1];
-			for (i=0, s=0; i<(int)run->argc; i++, argv++)	s+=argv[i];
+			int s = 0;
+			for (int i=0; i<(int)run->argc; i++, argv++)	s+=argv[i];
 			memcpy(PSM(0), argv, s);
 //			threads_array[0].argstring = 0;
 			runStatus = STOP;

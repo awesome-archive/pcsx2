@@ -1,43 +1,117 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2014-2014  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
-#include "PrecompiledHeader.h"
 #include "BiosDebugData.h"
-#include "../Memory.h"
+#include "IopMem.h"
+#include "Memory.h"
+#include "VMManager.h"
 
-std::vector<EEThread> getEEThreads()
+std::vector<std::unique_ptr<BiosThread>> getEEThreads()
 {
-	std::vector<EEThread> threads;
+	if (!VMManager::HasValidVM() || CurrentBiosInformation.eeThreadListAddr == 0)
+		return {};
 
-	if (CurrentBiosInformation == NULL)
-		return threads;
+	const u32 start = CurrentBiosInformation.eeThreadListAddr & 0x3fffff;
 
-	u32 start = CurrentBiosInformation->threadListAddr & 0x3fffff;
+	std::vector<std::unique_ptr<BiosThread>> threads;
 	for (int tid = 0; tid < 256; tid++)
 	{
-		EEThread thread;
+		EEInternalThread* internal = static_cast<EEInternalThread*>(
+			PSM(start + tid * sizeof(EEInternalThread)));
 
-		EEInternalThread* internal = (EEInternalThread*) PSM(start+tid*sizeof(EEInternalThread));
-		if (internal->status != THS_BAD)
-		{
-			thread.tid = tid;
-			thread.data = *internal;
-			threads.push_back(thread);
-		}
+		if (internal && internal->status != (int)ThreadStatus::THS_BAD)
+			threads.emplace_back(std::make_unique<EEThread>(tid, *internal));
 	}
 
 	return threads;
 }
 
+std::vector<std::unique_ptr<BiosThread>> getIOPThreads()
+{
+	if (!VMManager::HasValidVM() || CurrentBiosInformation.iopThreadListAddr == 0)
+		return {};
+
+	std::vector<std::unique_ptr<BiosThread>> threads;
+
+	u32 item = iopMemRead32(CurrentBiosInformation.iopThreadListAddr);
+
+	for (int i = 0; item != 0; i++)
+	{
+		if (i > 1000)
+			return {};
+
+		IOPInternalThread data{};
+
+		u16 tag = iopMemRead16(item + 0x8);
+		if (tag != 0x7f01)
+		{
+			// something went wrong
+			return {};
+		}
+
+		data.stacMem = iopMemRead32(item + 0x3c);
+		data.stackSize = iopMemRead32(item + 0x40);
+		data.status = iopMemRead8(item + 0xc);
+		data.tid = iopMemRead16(item + 0xa);
+		data.entrypoint = iopMemRead32(item + 0x38);
+		data.waitstate = iopMemRead16(item + 0x1c);
+		data.waitId = iopMemRead32(item + 0x20);
+		data.initPriority = iopMemRead16(item + 0xe);
+
+		data.regCtx = iopMemRead32(item + 0x10);
+
+		data.PC = iopMemRead32(data.regCtx + 0x8c);
+
+		threads.emplace_back(std::make_unique<IOPThread>(data));
+
+		item = iopMemRead32(item + 0x24);
+	}
+
+
+	return threads;
+}
+
+std::vector<IopMod> getIOPModules()
+{
+	if (!VMManager::HasValidVM() || CurrentBiosInformation.iopModListAddr == 0)
+		return {};
+
+	u32 maddr = iopMemRead32(CurrentBiosInformation.iopModListAddr);
+	std::vector<IopMod> modlist;
+
+	for (int i = 0; maddr != 0; i++)
+	{
+		if (maddr >= Ps2MemSize::ExposedIopRam)
+		{
+			// outside of memory
+			return {};
+		}
+
+		if (i > 1000)
+			return {};
+
+		IopMod& mod = modlist.emplace_back();
+
+		u32 nstr = iopMemRead32(maddr + 4);
+		if (nstr)
+		{
+			mod.name = iopMemReadString(iopMemRead32(maddr + 4));
+		}
+		else
+		{
+			mod.name = "(NULL)";
+		}
+
+		mod.version = iopMemRead16(maddr + 8);
+		mod.entry = iopMemRead32(maddr + 0x10);
+		mod.gp = iopMemRead32(maddr + 0x14);
+		mod.text_addr = iopMemRead32(maddr + 0x18);
+		mod.text_size = iopMemRead32(maddr + 0x1c);
+		mod.data_size = iopMemRead32(maddr + 0x20);
+		mod.bss_size = iopMemRead32(maddr + 0x24);
+
+		maddr = iopMemRead32(maddr);
+	}
+
+	return modlist;
+}

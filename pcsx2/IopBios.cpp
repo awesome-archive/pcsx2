@@ -1,90 +1,100 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
-
-#include "PrecompiledHeader.h"
-#include "IopCommon.h"
-#include "R5900.h" // for g_GameStarted
+#include "Common.h"
+#include "DebugTools/SymbolGuardian.h"
+#include "IopBios.h"
+#include "IopMem.h"
+#include "R3000A.h"
+#include "R5900.h"
+#include "ps2/BiosTools.h"
+#include "VMManager.h"
 
 #include <ctype.h>
+#include <fmt/format.h>
 #include <string.h>
+#include <sys/stat.h>
+#include "common/FileSystem.h"
+#include "common/Path.h"
+
+#include <cctype>
+#include <cstring>
+#include <fmt/format.h>
+#include <sys/stat.h>
+#include <algorithm>
+
+#include <fcntl.h>
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
+#if !defined(S_ISREG) && defined(S_IFMT) && defined(S_IFREG)
+#define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#endif
+#if !defined(S_ISDIR) && defined(S_IFMT) && defined(S_IFDIR)
+#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#endif
 
 #ifndef O_BINARY
 #define O_BINARY 0
 #endif
 
-// set this to 0 to disable rewriting 'host:' paths!
-#define USE_HOST_REWRITE 1
-
-#if USE_HOST_REWRITE
-#	ifdef _WIN32
-		// disable this if you DON'T want "host:/usr/local/" paths
-		// to get rewritten into host:/
-#		define HOST_REWRITE_USR_LOCAL 1
-#	else
-		// unix/linux users might want to set it to 1
-		// if they DO want to keep demos from accessing their systems' /usr/local
-#		define HOST_REWRITE_USR_LOCAL 0
-#	endif
-
-static char HostRoot[1024];
-#endif
-
-void Hle_SetElfPath(const char* elfFileName)
+typedef struct
 {
-#if USE_HOST_REWRITE
-	DevCon.WriteLn("HLE Host: Will load ELF: %s\n", elfFileName);
+	u32 mode;
+	u32 attr;
+	u32 size;
+	u8 ctime[8];
+	u8 atime[8];
+	u8 mtime[8];
+	u32 hisize;
+} fio_stat_t;
+typedef struct
+{
+	fio_stat_t _fioStat;
+	/** Number of subs (main) / subpart number (sub) */
+	u32 private_0;
+	u32 private_1;
+	u32 private_2;
+	u32 private_3;
+	u32 private_4;
+	/** Sector start.  */
+	u32 private_5;
+} fxio_stat_t;
 
-	const char* pos1 = strrchr(elfFileName,'/');
-	const char* pos2 = strrchr(elfFileName,'\\');
+typedef struct
+{
+	fio_stat_t stat;
+	char name[256];
+	u32 unknown;
+} fio_dirent_t;
 
-	if(pos2 > pos1) // we want the LAST path separator
-		pos1=pos2;
+typedef struct
+{
+	fxio_stat_t stat;
+	char name[256];
+	u32 unknown;
+} fxio_dirent_t;
 
-	if(!pos1) // if pos1 is NULL, then pos2 was not > pos1, so it must also be NULL
-	{
-		Console.WriteLn("HLE Notice: ELF does not have a path.\n");
+static std::string hostRoot;
 
-		// use %CD%/host/
-		char* cwd = getcwd(HostRoot,1000); // save the other 23 chars to append /host/ :P
-		HostRoot[1000]=0; // Be Safe.
-		if (cwd == nullptr) {
-			Console.Error("Hle_SetElfPath: getcwd: buffer is too small");
-			return;
-		}
-
-		char* last = HostRoot + strlen(HostRoot) - 1;
-
-		if((*last!='/') && (*last!='\\')) // PathAppend()-ish
-			last++;
-
-		strcpy(last,"/host/");
-
-		return;
-	}
-
-	int len = pos1-elfFileName+1;
-	memcpy(HostRoot,elfFileName,len); // include the / (or \\)
-	HostRoot[len] = 0;
-
-	Console.WriteLn("HLE Host: Set 'host:' root path to: %s\n", HostRoot);
-
-#endif
+void Hle_SetHostRoot(const char* bootFilename)
+{
+	std::string path = Path::RealPath(bootFilename);
+	hostRoot = Path::ToNativePath(Path::GetDirectory(path));
+	Console.WriteLn("HLE Host: Set 'host:' root path to: %s", hostRoot.c_str());
 }
 
-namespace R3000A {
+void Hle_ClearHostRoot()
+{
+	hostRoot = {};
+}
+
+namespace R3000A
+{
 
 #define v0 (psxRegs.GPR.n.v0)
 #define a0 (psxRegs.GPR.n.a0)
@@ -100,628 +110,1394 @@ namespace R3000A {
 #define Ra2 (iopMemReadString(a2))
 #define Ra3 (iopMemReadString(a3))
 
-static std::string host_path(const std::string path)
-{
-// WIP code. Works well on win32, not so sure on unixes
-// TODO: get rid of dependency on CWD/PWD
-#if USE_HOST_REWRITE
-	// we want filenames to be relative to pcs2dir / host
-
-	std::string pathMod;
-
-	// partial "rooting",
-	// it will NOT avoid a path like "../../x" from escaping the pcsx2 folder!
-
-
-	const std::string _local_root = "/usr/local/";
-	if (HOST_REWRITE_USR_LOCAL && 0 == path.compare(0, _local_root.size(), _local_root.data())) {
-		return HostRoot + path.substr(_local_root.size());
-	} else if ((path[0] == '/') || (path[0] == '\\') || (isalpha(path[0]) && (path[1] == ':'))) // absolute NATIVE path (X:\blah)
+	// Stat values differ between iomanX and ioman
+	// These values have been taken from the PS2SDK
+	// Specifically iox_stat.h
+	struct fio_stat_flags
 	{
-		// TODO: allow some way to use native paths in non-windows platforms
-		// maybe hack it so linux prefixes the path with "X:"? ;P
-		// or have all platforms use a common prefix for native paths
-		// FIXME: Why the hell would we allow this?
+		// Access flags
+		// Execute
+		int IXOTH;
+		// Write
+		int IWOTH;
+		// Read
+		int IROTH;
+
+		// File mode flags
+		// Symlink
+		int IFLNK;
+		// Regular file
+		int IFREG;
+		// Directory
+		int IFDIR;
+	};
+
+	fio_stat_flags ioman_stat{
+		0x01,
+		0x02,
+		0x04,
+		0x08,
+		0x10,
+		0x20,
+	};
+
+	fio_stat_flags iomanx_stat{
+		0x01,
+		0x02,
+		0x04,
+		0x4000,
+		0x2000,
+		0x1000,
+	};
+
+	// This is a workaround for GHS on *NIX platforms
+	// Whenever a program splits directories with a backslash (ulaunchelf)
+	// the directory is considered non-existant
+	static __fi std::string clean_path(const std::string& path)
+	{
+#ifndef _WIN32
+		std::string ret = path;
+		std::replace(ret.begin(), ret.end(), '\\', '/');
+		return ret;
+#else // This function will cause problems with Windows WSL / device paths where forward slashes are required
 		return path;
-	} else // relative paths
-		return HostRoot + path;
-
-	return pathMod;
-#else
-	return path;
 #endif
-}
-
-// TODO: sandbox option, other permissions
-class HostFile : public IOManFile
-{
-public:
-	int fd;
-
-	HostFile(int hostfd)
-	{
-		fd = hostfd;
 	}
 
-	virtual ~HostFile() = default;
-
-	static __fi int translate_error(int err)
+	static int host_stat(const std::string& path, fio_stat_t* host_stats, fio_stat_flags& stat = ioman_stat)
 	{
-		if (err >= 0)
-			return err;
+		struct stat file_stats;
+		const std::string file_path(ioman::host_path(path, true));
 
-		switch(err)
+		if (!FileSystem::StatFile(file_path.c_str(), &file_stats))
+			return -IOP_ENOENT;
+
+		host_stats->size = (u32)file_stats.st_size;
+		host_stats->hisize = 0;
+
+		// Convert the mode.
+		host_stats->mode = (file_stats.st_mode & (stat.IROTH | stat.IWOTH | stat.IXOTH));
+#ifndef _WIN32
+		if (S_ISLNK(file_stats.st_mode))
 		{
-			case -ENOENT:
-				return -IOP_ENOENT;
-			case -EACCES:
-				return -IOP_EACCES;
-			case -EISDIR:
-				return -IOP_EISDIR;
-			case -EIO:
-			default:
-				return -IOP_EIO;
+			host_stats->mode |= stat.IFLNK;
 		}
-	}
-
-	static int open(IOManFile **file, const std::string &full_path, s32 flags, u16 mode)
-	{
-		const std::string path = full_path.substr(full_path.find(':') + 1);
-
-		// host: actually DOES let you write!
-		//if (flags != IOP_O_RDONLY)
-		//	return -IOP_EROFS;
-
-		int native_flags = O_BINARY; // necessary in Windows.
-
-		switch(flags&IOP_O_RDWR)
+#endif
+		if (S_ISREG(file_stats.st_mode))
 		{
-		case IOP_O_RDONLY:	native_flags |= O_RDONLY;	break;
-		case IOP_O_WRONLY:	native_flags |= O_WRONLY; break;
-		case IOP_O_RDWR:	native_flags |= O_RDWR;	break;
+			host_stats->mode |= stat.IFREG;
+		}
+		if (S_ISDIR(file_stats.st_mode))
+		{
+			host_stats->mode |= stat.IFDIR;
 		}
 
-		if(flags&IOP_O_APPEND)	native_flags |= O_APPEND;
-		if(flags&IOP_O_CREAT)	native_flags |= O_CREAT;
-		if(flags&IOP_O_TRUNC)	native_flags |= O_TRUNC;
+		// Convert the creation time.
+		struct tm* loctime;
+		loctime = localtime(&(file_stats.st_ctime));
+		host_stats->ctime[6] = (unsigned char)loctime->tm_year;
+		host_stats->ctime[5] = (unsigned char)loctime->tm_mon + 1;
+		host_stats->ctime[4] = (unsigned char)loctime->tm_mday;
+		host_stats->ctime[3] = (unsigned char)loctime->tm_hour;
+		host_stats->ctime[2] = (unsigned char)loctime->tm_min;
+		host_stats->ctime[1] = (unsigned char)loctime->tm_sec;
 
-		int hostfd = ::open(host_path(path).data(), native_flags);
-		if (hostfd < 0)
-			return translate_error(hostfd);
+		// Convert the access time.
+		loctime = localtime(&(file_stats.st_atime));
+		host_stats->atime[6] = (unsigned char)loctime->tm_year;
+		host_stats->atime[5] = (unsigned char)loctime->tm_mon + 1;
+		host_stats->atime[4] = (unsigned char)loctime->tm_mday;
+		host_stats->atime[3] = (unsigned char)loctime->tm_hour;
+		host_stats->atime[2] = (unsigned char)loctime->tm_min;
+		host_stats->atime[1] = (unsigned char)loctime->tm_sec;
 
-		*file = new HostFile(hostfd);
-		if (!*file)
-			return -IOP_ENOMEM;
+		// Convert the last modified time.
+		loctime = localtime(&(file_stats.st_mtime));
+		host_stats->mtime[6] = (unsigned char)loctime->tm_year;
+		host_stats->mtime[5] = (unsigned char)loctime->tm_mon + 1;
+		host_stats->mtime[4] = (unsigned char)loctime->tm_mday;
+		host_stats->mtime[3] = (unsigned char)loctime->tm_hour;
+		host_stats->mtime[2] = (unsigned char)loctime->tm_min;
+		host_stats->mtime[1] = (unsigned char)loctime->tm_sec;
 
 		return 0;
 	}
 
-	virtual void close()
+	static int host_stat(const std::string& path, fxio_stat_t* host_stats)
 	{
-		::close(fd);
-		delete this;
+		return host_stat(path, &host_stats->_fioStat, iomanx_stat);
 	}
 
-	virtual int lseek(s32 offset, s32 whence)
+	// TODO: sandbox option, other permissions
+	class HostFile : public IOManFile
 	{
-		int err;
+	public:
+		int fd;
 
-		switch (whence)
+		HostFile(int hostfd)
 		{
-			case IOP_SEEK_SET:
-				err = ::lseek(fd, offset, SEEK_SET);
-				break;
-			case IOP_SEEK_CUR:
-				err = ::lseek(fd, offset, SEEK_CUR);
-				break;
-			case IOP_SEEK_END:
-				err = ::lseek(fd, offset, SEEK_END);
-				break;
-			default:
-				return -IOP_EIO;
+			fd = hostfd;
 		}
 
-		return translate_error(err);
-	}
+		virtual ~HostFile() = default;
 
-	virtual int read(void *buf, u32 count)
-	{
-		return translate_error(::read(fd, buf, count));
-	}
-
-	virtual int write(void *buf, u32 count)
-	{
-		return translate_error(::write(fd, buf, count));
-	}
-};
-
-namespace ioman {
-	const int firstfd = 0x100;
-	const int maxfds = 0x100;
-	int openfds = 0;
-
-	int freefdcount()
-	{
-		return maxfds - openfds;
-	}
-
-	struct filedesc
-	{
-		enum {
-			FILE_FREE,
-			FILE_FILE,
-			FILE_DIR,
-		} type;
-		union {
-			IOManFile *file;
-			IOManDir *dir;
-		};
-
-		operator bool() const { return type != FILE_FREE; }
-		operator IOManFile*() const { return type == FILE_FILE ? file : NULL; }
-		operator IOManDir*() const { return type == FILE_DIR ? dir : NULL; }
-		void operator=(IOManFile *f) { type = FILE_FILE; file = f; openfds++; }
-		void operator=(IOManDir *d) { type = FILE_DIR; dir = d; openfds++; }
-
-		void close()
+		static __fi int translate_error(int err)
 		{
-			switch (type)
+			if (err >= 0)
+				return err;
+
+			switch (err)
 			{
-				case FILE_FILE:
-					file->close();
-					file = NULL;
+				case -ENOENT:
+					return -IOP_ENOENT;
+				case -EACCES:
+					return -IOP_EACCES;
+				case -EISDIR:
+					return -IOP_EISDIR;
+				case -EIO:
+				default:
+					return -IOP_EIO;
+			}
+		}
+
+		static int open(IOManFile** file, const std::string& full_path, s32 flags, u16 mode)
+		{
+			const std::string path(full_path.substr(full_path.find(':') + 1));
+			const std::string file_path(ioman::host_path(path, false));
+			int native_flags = O_BINARY; // necessary in Windows.
+
+			switch (flags & IOP_O_RDWR)
+			{
+				case IOP_O_RDONLY:
+					native_flags |= O_RDONLY;
 					break;
-				case FILE_DIR:
-					dir->close();
-					dir = NULL;
+				case IOP_O_WRONLY:
+					native_flags |= O_WRONLY;
 					break;
-				case FILE_FREE:
-					return;
+				case IOP_O_RDWR:
+					native_flags |= O_RDWR;
+					break;
 			}
 
-			type = FILE_FREE;
-			openfds--;
+			if (flags & IOP_O_APPEND)
+				native_flags |= O_APPEND;
+			if (flags & IOP_O_CREAT)
+				native_flags |= O_CREAT;
+			if (flags & IOP_O_TRUNC)
+				native_flags |= O_TRUNC;
+
+#ifdef _WIN32
+			const int native_mode = _S_IREAD | _S_IWRITE;
+#else
+			const int native_mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+#endif
+
+			const int hostfd = FileSystem::OpenFDFile(file_path.c_str(), native_flags, native_mode);
+			if (hostfd < 0)
+				return translate_error(hostfd);
+
+			*file = new HostFile(hostfd);
+			if (!*file)
+				return -IOP_ENOMEM;
+
+			return 0;
+		}
+
+		virtual void close()
+		{
+			::close(fd);
+			delete this;
+		}
+
+		virtual int lseek(s32 offset, s32 whence)
+		{
+			int err;
+
+			switch (whence)
+			{
+				case IOP_SEEK_SET:
+					err = static_cast<int>(::lseek(fd, offset, SEEK_SET));
+					break;
+				case IOP_SEEK_CUR:
+					err = static_cast<int>(::lseek(fd, offset, SEEK_CUR));
+					break;
+				case IOP_SEEK_END:
+					err = static_cast<int>(::lseek(fd, offset, SEEK_END));
+					break;
+				default:
+					return -IOP_EIO;
+			}
+
+			return translate_error(err);
+		}
+
+		virtual int read(void* buf, u32 count) /* Flawfinder: ignore */
+		{
+			return translate_error(static_cast<int>(::read(fd, buf, count)));
+		}
+
+		virtual int write(void* buf, u32 count)
+		{
+			return translate_error(static_cast<int>(::write(fd, buf, count)));
 		}
 	};
 
-	filedesc fds[maxfds];
-
-	template<typename T>
-	T* getfd(int fd)
+	class HostDir : public IOManDir
 	{
-		fd -= firstfd;
+	public:
+		FileSystem::FindResultsArray results;
+		FileSystem::FindResultsArray::iterator dir;
+		std::string basedir;
 
-		if (fd < 0 || fd >= maxfds)
-			return NULL;
-
-		return fds[fd];
-	}
-
-	template <typename T>
-	int allocfd(T *obj)
-	{
-		for (int i = 0; i < maxfds; i++)
+		HostDir(FileSystem::FindResultsArray results_, std::string basedir_)
+			: results(std::move(results_))
+			, basedir(std::move(basedir_))
 		{
-			if (!fds[i])
-			{
-				fds[i] = obj;
-				return firstfd + i;
-			}
+			dir = results.begin();
 		}
 
-		obj->close();
-		return -IOP_EMFILE;
-	}
+		virtual ~HostDir() = default;
 
-	void freefd(int fd)
-	{
-		fd -= firstfd;
-
-		if (fd < 0 || fd >= maxfds)
-			return;
-
-		fds[fd].close();
-	}
-
-	void reset()
-	{
-		for (int i = 0; i < maxfds; i++)
-			fds[i].close();
-	}
-
-	bool is_host(const std::string path)
-	{
-		auto not_number_pos = path.find_first_not_of("0123456789", 4);
-		if (not_number_pos == std::string::npos)
-			return false;
-
-		return ((!g_GameStarted || EmuConfig.HostFs) && 0 == path.compare(0, 4, "host") && path[not_number_pos] == ':');
-	}
-
-	int open_HLE()
-	{
-		IOManFile *file = NULL;
-		const std::string path = Ra0;
-		s32 flags = a1;
-		u16 mode = a2;
-
-		if (is_host(path))
+		static int open(IOManDir** dir, const std::string& full_path)
 		{
-			if (!freefdcount())
+			std::string relativePath = full_path.substr(full_path.find(':') + 1);
+			std::string path = ioman::host_path(relativePath, true);
+
+			if (!FileSystem::DirectoryExists(path.c_str()))
+				return -IOP_ENOENT; // Should return ENOTDIR if path is a file?
+
+			FileSystem::FindResultsArray results;
+			FileSystem::FindFiles(path.c_str(), "*", FILESYSTEM_FIND_FILES | FILESYSTEM_FIND_FOLDERS | FILESYSTEM_FIND_RELATIVE_PATHS | FILESYSTEM_FIND_HIDDEN_FILES, &results);
+
+			*dir = new HostDir(std::move(results), std::move(path));
+			if (!*dir)
+				return -IOP_ENOMEM;
+
+			return 0;
+		}
+
+		virtual int read(void* buf, bool iomanX) /* Flawfinder: ignore */
+		{
+			if (dir == results.end())
+				return 0;
+
+			if (iomanX)
 			{
-				v0 = -IOP_EMFILE;
+				fxio_dirent_t* hostcontent = (fxio_dirent_t*)buf;
+				StringUtil::Strlcpy(hostcontent->name, dir->FileName, sizeof(hostcontent->name));
+				host_stat(ioman::host_path(Path::Combine(basedir, dir->FileName), true), &hostcontent->stat);
+			}
+			else
+			{
+				fio_dirent_t* hostcontent = (fio_dirent_t*)buf;
+				StringUtil::Strlcpy(hostcontent->name, dir->FileName, sizeof(hostcontent->name));
+				host_stat(ioman::host_path(Path::Combine(basedir, dir->FileName), true), &hostcontent->stat);
+			}
+
+			dir = std::next(dir);
+			return 1;
+		}
+
+		virtual void close()
+		{
+			delete this;
+		}
+	};
+
+	struct fileHandle
+	{
+		u32 fd_index;
+		std::string full_path;
+		s32 flags;
+		u16 mode;
+	};
+
+	std::vector<fileHandle> handles;
+
+	namespace ioman
+	{
+		const int firstfd = 0x100;
+		const int maxfds = 0x100;
+		int openfds = 0;
+
+		int freefdcount()
+		{
+			return maxfds - openfds;
+		}
+
+		struct filedesc
+		{
+			enum
+			{
+				FILE_FREE,
+				FILE_FILE,
+				FILE_DIR,
+			} type;
+			union
+			{
+				IOManFile* file;
+				IOManDir* dir;
+			};
+
+			constexpr filedesc()
+				: type(FILE_FREE)
+				, file(nullptr)
+			{
+			}
+			operator bool() const { return type != FILE_FREE; }
+			operator IOManFile*() const { return type == FILE_FILE ? file : NULL; }
+			operator IOManDir*() const { return type == FILE_DIR ? dir : NULL; }
+			void operator=(IOManFile* f)
+			{
+				type = FILE_FILE;
+				file = f;
+				openfds++;
+			}
+			void operator=(IOManDir* d)
+			{
+				type = FILE_DIR;
+				dir = d;
+				openfds++;
+			}
+
+			void close()
+			{
+				switch (type)
+				{
+					case FILE_FILE:
+						file->close();
+						file = NULL;
+						break;
+					case FILE_DIR:
+						dir->close();
+						dir = NULL;
+						break;
+					case FILE_FREE:
+						return;
+				}
+
+				type = FILE_FREE;
+				openfds--;
+			}
+		};
+
+		filedesc fds[maxfds];
+
+		template <typename T>
+		T* getfd(int fd)
+		{
+			fd -= firstfd;
+
+			if (fd < 0 || fd >= maxfds)
+				return NULL;
+
+			return fds[fd];
+		}
+
+		template <typename T>
+		int allocfd(T* obj)
+		{
+			for (int i = 0; i < maxfds; i++)
+			{
+				if (!fds[i])
+				{
+					fds[i] = obj;
+					return firstfd + i;
+				}
+			}
+
+			obj->close();
+			return -IOP_EMFILE;
+		}
+
+		void freefd(int fd)
+		{
+			fd -= firstfd;
+
+			if (fd < 0 || fd >= maxfds)
+				return;
+
+			fds[fd].close();
+		}
+
+		void reset()
+		{
+			for (int i = 0; i < maxfds; i++)
+			{
+				if (fds[i])
+					fds[i].close();
+			}
+			handles.clear();
+		}
+
+		bool is_host(const std::string_view path)
+		{
+			auto not_number_pos = path.find_first_not_of("0123456789", 4);
+			if (not_number_pos == std::string::npos)
+				return false;
+
+			return (path.compare(0, 4, "host") == 0 && path[not_number_pos] == ':');
+		}
+
+		std::string host_path(const std::string_view path, bool allow_open_host_root)
+		{
+			// We are NOT allowing to use the root of the host unit.
+			// For now it just supports relative folders from the location of the elf
+			std::string native_path(Path::Canonicalize(path));
+			std::string new_path;
+			if (!hostRoot.empty() && native_path.starts_with(hostRoot))
+				new_path = std::move(native_path);
+			else if (!hostRoot.empty()) // relative paths
+				new_path = Path::Combine(hostRoot, native_path);
+
+			// Allow opening the ELF override.
+			if (new_path == VMManager::Internal::GetELFOverride())
+				return new_path;
+
+			// Allow nothing if hostfs isn't enabled.
+			if (!EmuConfig.HostFs)
+			{
+				new_path.clear();
+				return new_path;
+			}
+
+			// Double-check that it falls within the directory of the elf.
+			// Not a real sandbox, but emulators shouldn't be treated as such. Don't run untrusted code!
+			std::string canonicalized_path(Path::Canonicalize(new_path));
+
+			// Are we opening the root of host? (i.e. `host:.` or `host:`)
+			// We want to allow this as a directory open, but not as a file open.
+			if (!allow_open_host_root || canonicalized_path != hostRoot)
+			{
+				// Only allow descendants of the hostfs directory.
+				if (canonicalized_path.length() <= hostRoot.length() || // Length has to be equal or longer,
+					!canonicalized_path.starts_with(hostRoot) || // and start with the host root,
+					canonicalized_path[hostRoot.length()] != FS_OSPATH_SEPARATOR_CHARACTER) // and we can't access a sibling.
+				{
+					Console.Error(fmt::format(
+						"IopHLE: Denying access to path outside of ELF directory. Requested path: '{}', Resolved path: '{}', ELF directory: '{}'",
+						path, new_path, hostRoot));
+					new_path.clear();
+				}
+			}
+
+			return new_path;
+		}
+
+		int open_HLE()
+		{
+			IOManFile* file = NULL;
+			const std::string path = clean_path(Ra0);
+			s32 flags = a1;
+			u16 mode = a2;
+
+			if (is_host(path))
+			{
+				if (!freefdcount())
+				{
+					v0 = -IOP_EMFILE;
+					pc = ra;
+					return 1;
+				}
+
+				int err = HostFile::open(&file, path, flags, mode);
+
+				if (err != 0 || !file)
+				{
+					if (err == 0) // ???
+						err = -IOP_EIO;
+					if (file) // ??????
+						file->close();
+					v0 = err;
+				}
+				else
+				{
+					v0 = allocfd(file);
+					if ((s32)v0 < 0)
+						file->close();
+					else
+					{
+						fileHandle handle;
+						handle.fd_index = v0 - firstfd;
+						handle.flags = flags;
+						handle.full_path = path;
+						handle.mode = mode;
+						handles.push_back(handle);
+					}
+				}
+
 				pc = ra;
 				return 1;
 			}
 
-			int err = HostFile::open(&file, path, flags, mode);
+			return 0;
+		}
 
-			if (err != 0 || !file)
+		int close_HLE()
+		{
+			s32 fd = a0;
+
+			if (getfd<IOManFile>(fd))
 			{
-				if (err == 0) // ???
-					err = -IOP_EIO;
-				if (file) // ??????
-					file->close();
-				v0 = err;
+				freefd(fd);
+
+				for (size_t i = 0; i < handles.size(); i++)
+				{
+					if (handles[i].fd_index == (u32)fd - firstfd)
+					{
+						handles.erase(handles.begin() + i);
+						break;
+					}
+				}
+
+				v0 = 0;
+				pc = ra;
+				return 1;
+			}
+
+			return 0;
+		}
+
+		int dopen_HLE()
+		{
+			IOManDir* dir = NULL;
+			const std::string path = clean_path(Ra0);
+
+			if (is_host(path))
+			{
+				int err = HostDir::open(&dir, path);
+
+				if (err != 0 || !dir)
+				{
+					if (err == 0)
+						err = -IOP_EIO;
+					if (dir)
+						dir->close();
+					v0 = err;
+				}
+				else
+				{
+					v0 = allocfd(dir);
+					if ((s32)v0 < 0)
+						dir->close();
+				}
+
+				pc = ra;
+				return 1;
+			}
+
+			return 0;
+		}
+
+		int dclose_HLE()
+		{
+			s32 dir = a0;
+
+			if (getfd<IOManDir>(dir))
+			{
+				freefd(dir);
+				v0 = 0;
+				pc = ra;
+				return 1;
+			}
+
+			return 0;
+		}
+
+		int _dread_HLE(bool iomanX)
+		{
+			s32 fh = a0;
+			u32 data = a1;
+			if (iomanX)
+			{
+				if (IOManDir* dir = getfd<IOManDir>(fh))
+				{
+					char buf[sizeof(fxio_dirent_t)];
+					v0 = dir->read(&buf, iomanX); /* Flawfinder: ignore */
+
+					for (s32 i = 0; i < (s32)sizeof(fxio_dirent_t); i++)
+						iopMemWrite8(data + i, buf[i]);
+
+					pc = ra;
+					return 1;
+				}
 			}
 			else
 			{
-				v0 = allocfd(file);
-				if ((s32)v0 < 0)
-					file->close();
+				if (IOManDir* dir = getfd<IOManDir>(fh))
+				{
+					char buf[sizeof(fio_dirent_t)];
+					v0 = dir->read(&buf); /* Flawfinder: ignore */
+
+					for (s32 i = 0; i < (s32)sizeof(fio_dirent_t); i++)
+						iopMemWrite8(data + i, buf[i]);
+
+					pc = ra;
+					return 1;
+				}
+			}
+			return 0;
+		}
+
+		int dread_HLE()
+		{
+			return _dread_HLE(false);
+		}
+
+		int dreadx_HLE()
+		{
+			return _dread_HLE(true);
+		}
+
+		int _getStat_HLE(bool iomanx)
+		{
+			const std::string path = clean_path(Ra0);
+			u32 data = a1;
+
+			if (is_host(path))
+			{
+				const std::string full_path = host_path(path.substr(path.find(':') + 1), true);
+				if (iomanx)
+				{
+					char buf[sizeof(fxio_stat_t)];
+					v0 = host_stat(full_path, (fxio_stat_t*)&buf);
+
+					for (size_t i = 0; i < sizeof(fxio_stat_t); i++)
+						iopMemWrite8(static_cast<u32>(data + i), buf[i]);
+				}
+				else
+				{
+					char buf[sizeof(fio_stat_t)];
+					v0 = host_stat(full_path, (fio_stat_t*)&buf);
+
+					for (size_t i = 0; i < sizeof(fio_stat_t); i++)
+						iopMemWrite8(static_cast<u32>(data + i), buf[i]);
+				}
+				pc = ra;
+				return 1;
 			}
 
-			pc = ra;
-			return 1;
+			return 0;
 		}
 
-		return 0;
-	}
-
-	int close_HLE()
-	{
-		s32 fd = a0;
-
-		if (getfd<IOManFile>(fd))
+		int getStat_HLE()
 		{
-			freefd(fd);
-			v0 = 0;
-			pc = ra;
-			return 1;
+			return _getStat_HLE(false);
 		}
 
-		return 0;
-	}
-
-	int lseek_HLE()
-	{
-		s32 fd = a0;
-		s32 offset = a1;
-		s32 whence = a2;
-
-		if (IOManFile *file = getfd<IOManFile>(fd))
+		int getStatx_HLE()
 		{
-			v0 = file->lseek(offset, whence);
-			pc = ra;
-			return 1;
+			return _getStat_HLE(true);
 		}
 
-		return 0;
-	}
-
-	int read_HLE()
-	{
-		s32 fd = a0;
-		u32 data = a1;
-		u32 count = a2;
-
-		if (IOManFile *file = getfd<IOManFile>(fd))
+		int lseek_HLE()
 		{
-			try {
-				std::unique_ptr<char[]> buf(new char[count]);
+			s32 fd = a0;
+			s32 offset = a1;
+			s32 whence = a2;
+
+			if (IOManFile* file = getfd<IOManFile>(fd))
+			{
+				v0 = file->lseek(offset, whence);
+				pc = ra;
+				return 1;
+			}
+
+			return 0;
+		}
+
+		int remove_HLE()
+		{
+			const std::string full_path = clean_path(Ra0);
+
+			if (is_host(full_path))
+			{
+				const std::string path = full_path.substr(full_path.find(':') + 1);
+				const std::string file_path(host_path(path, false));
+				const bool succeeded = FileSystem::DeleteFilePath(file_path.c_str());
+				if (!succeeded)
+					Console.Warning("IOPHLE remove_HLE failed for '%s'", file_path.c_str());
+				v0 = succeeded ? 0 : -IOP_EIO;
+				pc = ra;
+			}
+			return 0;
+		}
+
+		int mkdir_HLE()
+		{
+			const std::string full_path = clean_path(Ra0);
+
+			if (is_host(full_path))
+			{
+				const std::string path = full_path.substr(full_path.find(':') + 1);
+				const std::string folder_path(host_path(path, false)); // NOTE: Don't allow creating the ELF directory.
+				const bool succeeded = FileSystem::CreateDirectoryPath(folder_path.c_str(), false);
+				if (!succeeded)
+					Console.Warning("IOPHLE mkdir_HLE failed for '%s'", folder_path.c_str());
+				v0 = succeeded ? 0 : -IOP_EIO;
+				pc = ra;
+				return 1;
+			}
+
+			return 0;
+		}
+
+		int read_HLE()
+		{
+			s32 fd = a0;
+			u32 data = a1;
+			u32 count = a2;
+
+			if (IOManFile* file = getfd<IOManFile>(fd))
+			{
+				auto buf = std::make_unique<char[]>(count);
 
 				v0 = file->read(buf.get(), count);
 
-				for (s32 i = 0; i < (s32)v0; i++)
-					iopMemWrite8(data + i, buf[i]);
-			}
-			catch (const std::bad_alloc &) {
-				v0 = -IOP_ENOMEM;
+				[[likely]]
+				if (v0 >= 0 && iopMemSafeWriteBytes(data, buf.get(), v0))
+				{
+					psxCpu->Clear(data, (v0 + 3) / 4);
+				}
+				else
+				{
+					for (s32 i = 0; i < static_cast<s32>(v0); i++)
+						iopMemWrite8(data + i, buf[i]);
+				}
+
+				pc = ra;
+				return 1;
 			}
 
-			pc = ra;
-			return 1;
+			return 0;
 		}
 
-		return 0;
-	}
-
-	int write_HLE()
-	{
-		s32 fd = a0;
-		u32 data = a1;
-		u32 count = a2;
-
-		if (fd == 1) // stdout
+		int rmdir_HLE()
 		{
-			const std::string s = Ra1;
-			iopConLog(ShiftJIS_ConvertString(s.data(), a2));
-			pc = ra;
-			v0 = a2;
-			return 1;
+			const std::string full_path = clean_path(Ra0);
+
+			if (is_host(full_path))
+			{
+				const std::string path = full_path.substr(full_path.find(':') + 1);
+				const std::string folder_path(host_path(path, false)); // NOTE: Don't allow removing the elf directory itself.
+				const bool succeeded = FileSystem::DeleteDirectory(folder_path.c_str());
+				if (!succeeded)
+					Console.Warning("IOPHLE rmdir_HLE failed for '%s'", folder_path.c_str());
+				v0 = succeeded ? 0 : -IOP_EIO;
+				pc = ra;
+				return 1;
+			}
+
+			return 0;
 		}
-		else if (IOManFile *file = getfd<IOManFile>(fd))
-		{
-			try {
-				std::unique_ptr<char[]> buf(new char[count]);
 
-				for (u32 i = 0; i < count; i++)
-					buf[i] = iopMemRead8(data + i);
+		int write_HLE()
+		{
+			s32 fd = a0;
+			u32 data = a1;
+			u32 count = a2;
+
+			if (fd == 1) // stdout
+			{
+				const std::string s = Ra1;
+				iopConLog(ShiftJIS_ConvertString(s.data(), a2));
+				pc = ra;
+				v0 = a2;
+				return 1;
+			}
+			else if (IOManFile* file = getfd<IOManFile>(fd))
+			{
+				auto buf = std::make_unique<char[]>(count);
+
+				[[unlikely]]
+				if (!iopMemSafeReadBytes(data, buf.get(), count))
+				{
+					for (u32 i = 0; i < count; i++)
+						buf[i] = iopMemRead8(data + i);
+				}
 
 				v0 = file->write(buf.get(), count);
-			}
-			catch (const std::bad_alloc &) {
-				v0 = -IOP_ENOMEM;
+
+				pc = ra;
+				return 1;
 			}
 
-			pc = ra;
-			return 1;
+			return 0;
 		}
+	} // namespace ioman
 
-		return 0;
-	}
-}
-
-namespace sysmem {
-	int Kprintf_HLE()
+	namespace sysmem
 	{
-		// Emulate the expected Kprintf functionality:
-		iopMemWrite32(sp, a0);
-		iopMemWrite32(sp + 4, a1);
-		iopMemWrite32(sp + 8, a2);
-		iopMemWrite32(sp + 12, a3);
-		pc = ra;
-
-		const std::string fmt = Ra0;
-
-		// From here we're intercepting the Kprintf and piping it to our console, complete with
-		// printf-style formatting processing.  This part can be skipped if the user has the
-		// console disabled.
-
-		if (!SysConsole.iopConsole.IsActive()) return 1;
-
-		char tmp[1024], tmp2[1024];
-		char *ptmp = tmp;
-		int n=1, i=0, j = 0;
-
-		while (fmt[i])
+		int Kprintf_HLE()
 		{
-			switch (fmt[i])
+
+			// Emulate the expected Kprintf functionality:
+			iopMemWrite32(sp, a0);
+			iopMemWrite32(sp + 4, a1);
+			iopMemWrite32(sp + 8, a2);
+			iopMemWrite32(sp + 12, a3);
+			pc = ra;
+
+			const std::string fmt = Ra0;
+
+			// From here we're intercepting the Kprintf and piping it to our console, complete with
+			// printf-style formatting processing.  This part can be skipped if the user has the
+			// console disabled.
+
+			if (!ConsoleLogging.iopConsole.IsActive())
+				return 1;
+
+			// maximum allowed size for our buffer before we truncate
+			constexpr unsigned int max_len = 4096;
+			char tmp[max_len], tmp2[max_len];
+			char* ptmp = tmp;
+			unsigned int printed_bytes = 0;
+			unsigned int n = 1, i = 0, j = 0;
+
+			while (fmt[i] && ptmp < std::end(tmp) - 1)
 			{
-				case '%':
-					j = 0;
-					tmp2[j++] = '%';
-_start:
-					switch (fmt[++i])
-					{
-						case '.':
-						case 'l':
-							tmp2[j++] = fmt[i];
-							goto _start;
-						default:
-							if (fmt[i] >= '0' && fmt[i] <= '9')
+				const int remaining_buf = static_cast<int>(std::end(tmp) - 1 - ptmp);
+				switch (fmt[i])
+				{
+					case '%':
+						j = 0;
+						tmp2[j++] = '%';
+					_start:
+						// let's check whether this is our null terminator
+						// before allowing the parser to proceed
+						if (fmt[i + 1])
+						{
+							switch (fmt[++i])
 							{
-								tmp2[j++] = fmt[i];
-								goto _start;
+								case '.':
+								case 'l':
+									if (j >= max_len)
+										break;
+									tmp2[j++] = fmt[i];
+									goto _start;
+								default:
+									if (fmt[i] >= '0' && fmt[i] <= '9')
+									{
+										if (j >= max_len)
+											break;
+										tmp2[j++] = fmt[i];
+										goto _start;
+									}
+									break;
 							}
+						}
+
+						if (j >= max_len)
 							break;
-					}
+						tmp2[j++] = fmt[i];
+						tmp2[j] = 0;
 
-					tmp2[j++] = fmt[i];
-					tmp2[j] = 0;
+						switch (fmt[i])
+						{
+							case 'f':
+							case 'F':
+								printed_bytes = std::min(remaining_buf, snprintf(ptmp, remaining_buf, tmp2, (float)iopMemRead32(sp + n * 4)));
+								ptmp += printed_bytes;
+								n++;
+								break;
 
-					switch (fmt[i])
-					{
-						case 'f': case 'F':
-							ptmp+= sprintf(ptmp, tmp2, (float)iopMemRead32(sp + n * 4));
-							n++;
-							break;
+							case 'a':
+							case 'A':
+							case 'e':
+							case 'E':
+							case 'g':
+							case 'G':
+								printed_bytes = std::min(remaining_buf, snprintf(ptmp, remaining_buf, tmp2, (double)iopMemRead32(sp + n * 4)));
+								ptmp += printed_bytes;
+								n++;
+								break;
 
-						case 'a': case 'A':
-						case 'e': case 'E':
-						case 'g': case 'G':
-							ptmp+= sprintf(ptmp, tmp2, (double)iopMemRead32(sp + n * 4));
-							n++;
-							break;
+							case 'p':
+							case 'i':
+							case 'd':
+							case 'D':
+							case 'o':
+							case 'O':
+							case 'x':
+							case 'X':
+							case 'u':
+							case 'U':
+								printed_bytes = std::min(remaining_buf, snprintf(ptmp, remaining_buf, tmp2, (u32)iopMemRead32(sp + n * 4)));
+								ptmp += printed_bytes;
+								n++;
+								break;
 
-						case 'p':
-						case 'i':
-						case 'd': case 'D':
-						case 'o': case 'O':
-						case 'x': case 'X':
-							ptmp+= sprintf(ptmp, tmp2, (u32)iopMemRead32(sp + n * 4));
-							n++;
-							break;
+							case 'c':
+								printed_bytes = std::min(remaining_buf, snprintf(ptmp, remaining_buf, tmp2, (u8)iopMemRead32(sp + n * 4)));
+								ptmp += printed_bytes;
+								n++;
+								break;
 
-						case 'c':
-							ptmp+= sprintf(ptmp, tmp2, (u8)iopMemRead32(sp + n * 4));
-							n++;
-							break;
-
-						case 's':
+							case 's':
 							{
 								std::string s = iopMemReadString(iopMemRead32(sp + n * 4));
-								ptmp += sprintf(ptmp, tmp2, s.data());
+								printed_bytes = std::min(remaining_buf, snprintf(ptmp, remaining_buf, tmp2, s.data()));
+								ptmp += printed_bytes;
 								n++;
 							}
 							break;
 
-						case '%':
-							*ptmp++ = fmt[i];
-							break;
+							case '%':
+								*ptmp++ = fmt[i];
+								break;
 
-						default:
-							break;
-					}
-					i++;
-					break;
+							default:
+								break;
+						}
+						i++;
+						break;
 
-				default:
-					*ptmp++ = fmt[i++];
-					break;
+					default:
+						*ptmp++ = fmt[i++];
+						break;
+				}
+			}
+			pxAssertRel(ptmp >= tmp && ptmp < std::end(tmp), "Overflowed tmp buffer");
+			*ptmp = 0;
+			iopConLog(ShiftJIS_ConvertString(tmp, 1023));
+
+			return 1;
+		}
+	} // namespace sysmem
+
+	namespace loadcore
+	{
+
+		u32 GetModList(u32 a0reg)
+		{
+			/* Loadcore puts a pointer to a static array at 0x3f0 */
+			u32 bootmodes_ptr = iopMemRead32(0x3f0);
+			/* Search for the main loadcore struct from there */
+			u32 lcstring = irxFindLoadcore(bootmodes_ptr);
+			u32 lc_struct = 0;
+
+			if (lcstring == 0)
+			{
+				lc_struct = bootmodes_ptr - 0x20;
+			}
+			else
+			{
+				lc_struct = lcstring + 0x18;
+			}
+
+			return lc_struct + 0x10;
+		}
+
+		// Gets the thread list ptr from thbase
+		u32 GetThreadList(u32 a0reg, u32 version)
+		{
+			// Function 3 returns the main thread manager struct
+			u32 function = iopMemRead32(a0reg + 0x20);
+
+			// read the lui
+			u32 thstruct = (iopMemRead32(function) & 0xFFFF) << 16;
+			thstruct |= iopMemRead32(function + 4) & 0xFFFF;
+
+			u32 list = thstruct + 0x42c;
+
+			if (version > 0x101)
+				list = thstruct + 0x430;
+
+			return list;
+		}
+
+		void LoadFuncs(u32 a0reg)
+		{
+			if (!EmuConfig.DebuggerAnalysis.GenerateSymbolsForIRXExports)
+				return;
+
+			const std::string modname = iopMemReadString(a0reg + 12, 8);
+			s32 version_major = iopMemRead8(a0reg + 9);
+			s32 version_minor = iopMemRead8(a0reg + 8);
+			DevCon.WriteLn(Color_Gray, "RegisterLibraryEntries: %8.8s version %x.%02x", modname.data(), version_major, version_minor);
+
+			R3000SymbolGuardian.ReadWrite([&](ccc::SymbolDatabase& database) {
+				ccc::Result<ccc::SymbolSourceHandle> source = database.get_symbol_source("IRX Export Table");
+				if (!source.success())
+					return;
+
+				// Enumerate the module symbols that already exist for this IRX
+				// module. Really there should only be one.
+				std::vector<ccc::ModuleHandle> existing_modules;
+				for (const auto& pair : database.modules.handles_from_name(modname))
+				{
+					const ccc::Module* existing_module = database.modules.symbol_from_handle(pair.second);
+					if (!existing_module || !existing_module->is_irx)
+						continue;
+
+					// Different major versions, we treat this one as a different module.
+					if (existing_module->version_major != version_major)
+						continue;
+
+					// RegisterLibraryEntries will fail if the new minor ver is <= the old minor ver
+					// and the major version is the same.
+					if (existing_module->version_minor >= version_minor)
+						return;
+
+					existing_modules.emplace_back(existing_module->handle());
+				}
+
+				// Destroy the old symbols for this IRX module if any exist.
+				for (ccc::ModuleHandle existing_module : existing_modules)
+					database.destroy_symbols_from_module(existing_module, true);
+
+				ccc::Result<ccc::Module*> module_symbol = database.modules.create_symbol(modname, *source, nullptr);
+				if (!module_symbol.success())
+					return;
+
+				(*module_symbol)->is_irx = true;
+				(*module_symbol)->version_major = version_major;
+				(*module_symbol)->version_minor = version_minor;
+
+				u32 func = a0reg + 20;
+				u32 funcptr = iopMemRead32(func);
+				u32 index = 0;
+				while (funcptr != 0)
+				{
+					const char* unqualified_name = irxImportFuncname(modname, index);
+
+					std::string qualified_name;
+					if (unqualified_name && unqualified_name[0] != '\0')
+						qualified_name = fmt::format("{}[{:02}]::{}", modname, index, unqualified_name);
+					else
+						qualified_name = fmt::format("{}[{:02}]::unkn_{:02}", modname, index, index);
+
+					ccc::Result<ccc::Function*> function = database.functions.create_symbol(qualified_name, funcptr, *source, *module_symbol);
+					if (!function.success())
+						return;
+
+					index++;
+					func += 4;
+					funcptr = iopMemRead32(func);
+				}
+			});
+		}
+
+		void ReleaseFuncs(u32 a0reg)
+		{
+			const std::string modname = iopMemReadString(a0reg + 12, 8);
+			s32 version_major = iopMemRead8(a0reg + 9);
+			s32 version_minor = iopMemRead8(a0reg + 8);
+
+			DevCon.WriteLn(Color_Gray, "ReleaseLibraryEntries: %8.8s version %x.%02x", modname.c_str(), version_major, version_minor);
+
+			R3000SymbolGuardian.ReadWrite([&](ccc::SymbolDatabase& database) {
+				// Enumerate the module symbols that exist for this IRX module.
+				// Really there should only be one.
+				std::vector<ccc::ModuleHandle> module_handles;
+				for (const auto& pair : database.modules.handles_from_name(modname))
+				{
+					const ccc::Module* module_symbol = database.modules.symbol_from_handle(pair.second);
+					if (!module_symbol || !module_symbol->is_irx)
+						continue;
+
+					if (module_symbol->version_major != version_major || module_symbol->version_minor != version_minor)
+						continue;
+
+					module_handles.emplace_back(module_symbol->handle());
+				}
+
+				// Destroy the symbols for the module.
+				for (ccc::ModuleHandle module_handle : module_handles)
+					database.destroy_symbols_from_module(module_handle, true);
+			});
+		}
+
+		int RegisterLibraryEntries_HLE()
+		{
+			LoadFuncs(a0);
+
+			const std::string modname = iopMemReadString(a0 + 12);
+			if (modname == "thbase")
+			{
+				const u32 version = iopMemRead32(a0 + 8);
+				CurrentBiosInformation.iopThreadListAddr = GetThreadList(a0, version);
+			}
+
+			CurrentBiosInformation.iopModListAddr = GetModList(a0);
+			return 0;
+		}
+
+		int ReleaseLibraryEntries_HLE()
+		{
+			ReleaseFuncs(a0);
+			return 0;
+		}
+	} // namespace loadcore
+
+	namespace intrman
+	{
+		// clang-format off
+		static const char* intrname[] = {
+			"INT_VBLANK",   "INT_GM",       "INT_CDROM",   "INT_DMA",		//00
+			"INT_RTC0",     "INT_RTC1",     "INT_RTC2",    "INT_SIO0",		//04
+			"INT_SIO1",     "INT_SPU",      "INT_PIO",     "INT_EVBLANK",	//08
+			"INT_DVD",      "INT_PCMCIA",   "INT_RTC3",    "INT_RTC4",		//0C
+			"INT_RTC5",     "INT_SIO2",     "INT_HTR0",    "INT_HTR1",		//10
+			"INT_HTR2",     "INT_HTR3",     "INT_USB",     "INT_EXTR",		//14
+			"INT_FWRE",     "INT_FDMA",     "INT_1A",      "INT_1B",		//18
+			"INT_1C",       "INT_1D",       "INT_1E",      "INT_1F",		//1C
+			"INT_dmaMDECi", "INT_dmaMDECo", "INT_dmaGPU",  "INT_dmaCD",		//20
+			"INT_dmaSPU",   "INT_dmaPIO",   "INT_dmaOTC",  "INT_dmaBERR",	//24
+			"INT_dmaSPU2",  "INT_dma8",     "INT_dmaSIF0", "INT_dmaSIF1",	//28
+			"INT_dmaSIO2i", "INT_dmaSIO2o", "INT_2E",      "INT_2F",		//2C
+			"INT_30",       "INT_31",       "INT_32",      "INT_33",		//30
+			"INT_34",       "INT_35",       "INT_36",      "INT_37",		//34
+			"INT_38",       "INT_39",       "INT_3A",      "INT_3B",		//38
+			"INT_3C",       "INT_3D",       "INT_3E",      "INT_3F",		//3C
+			"INT_MAX"														//40
+		};
+		// clang-format on
+
+		void RegisterIntrHandler_DEBUG()
+		{
+			if (a0 < std::size(intrname) - 1)
+			{
+				DevCon.WriteLn(Color_Gray, "RegisterIntrHandler: intr %s, handler %x", intrname[a0], a2);
+			}
+			else
+			{
+				DevCon.WriteLn(Color_Gray, "RegisterIntrHandler: intr UNKNOWN (%d), handler %x", a0, a2);
 			}
 		}
-		*ptmp = 0;
-		iopConLog( ShiftJIS_ConvertString(tmp, 1023) );
+	} // namespace intrman
 
-		return 1;
-	}
-}
-
-namespace loadcore {
-	void RegisterLibraryEntries_DEBUG()
+	namespace sifcmd
 	{
-		const std::string modname = iopMemReadString(a0 + 12);
-		DevCon.WriteLn(Color_Gray, "RegisterLibraryEntries: %8.8s version %x.%02x", modname.data(), (unsigned)iopMemRead8(a0 + 9), (unsigned)iopMemRead8(a0 + 8));
-	}
-}
+		void sceSifRegisterRpc_DEBUG()
+		{
+			DevCon.WriteLn(Color_Gray, "sifcmd sceSifRegisterRpc: rpc_id %x", a1);
+		}
+	} // namespace sifcmd
 
-namespace intrman {
-	static const char* intrname[] = {
-		"INT_VBLANK",   "INT_GM",       "INT_CDROM",   "INT_DMA",		//00
-		"INT_RTC0",     "INT_RTC1",     "INT_RTC2",    "INT_SIO0",		//04
-		"INT_SIO1",     "INT_SPU",      "INT_PIO",     "INT_EVBLANK",	//08
-		"INT_DVD",      "INT_PCMCIA",   "INT_RTC3",    "INT_RTC4",		//0C
-		"INT_RTC5",     "INT_SIO2",     "INT_HTR0",    "INT_HTR1",		//10
-		"INT_HTR2",     "INT_HTR3",     "INT_USB",     "INT_EXTR",		//14
-		"INT_FWRE",     "INT_FDMA",     "INT_1A",      "INT_1B",		//18
-		"INT_1C",       "INT_1D",       "INT_1E",      "INT_1F",		//1C
-		"INT_dmaMDECi", "INT_dmaMDECo", "INT_dmaGPU",  "INT_dmaCD",		//20
-		"INT_dmaSPU",   "INT_dmaPIO",   "INT_dmaOTC",  "INT_dmaBERR",	//24
-		"INT_dmaSPU2",  "INT_dma8",     "INT_dmaSIF0", "INT_dmaSIF1",	//28
-		"INT_dmaSIO2i", "INT_dmaSIO2o", "INT_2E",      "INT_2F",		//2C
-		"INT_30",       "INT_31",       "INT_32",      "INT_33",		//30
-		"INT_34",       "INT_35",       "INT_36",      "INT_37",		//34
-		"INT_38",       "INT_39",       "INT_3A",      "INT_3B",		//38
-		"INT_3C",       "INT_3D",       "INT_3E",      "INT_3F",		//3C
-		"INT_MAX"														//40
-	};
-
-	void RegisterIntrHandler_DEBUG()
+	u32 irxFindLoadcore(u32 entrypc)
 	{
-		DevCon.WriteLn(Color_Gray, "RegisterIntrHandler: intr %s, handler %x", intrname[a0], a2);
-	}
-}
+		u32 i;
 
-namespace sifcmd {
-	void sceSifRegisterRpc_DEBUG()
+		i = entrypc;
+		while (entrypc - i < 0x50)
+		{
+			// find loadcore string
+			if (iopMemRead32(i) == 0x49497350 && iopMemRead32(i + 4) == 0x64616F6C)
+			{
+				return i;
+			}
+			i -= 4;
+		}
+
+		return 0;
+	}
+
+	u32 irxImportTableAddr(u32 entrypc)
 	{
-		DevCon.WriteLn( Color_Gray, "sifcmd sceSifRegisterRpc: rpc_id %x", a1);
-	}
-}
+		u32 i;
 
-u32 irxImportTableAddr(u32 entrypc)
-{
-	u32 i;
+		i = entrypc - 0x18;
+		while (entrypc - i < 0x2000)
+		{
+			if (iopMemRead32(i) == 0x41e00000)
+				return i;
+			i -= 4;
+		}
 
-	i = entrypc - 0x18;
-	while (entrypc - i < 0x2000) {
-		if (iopMemRead32(i) == 0x41e00000)
-			return i;
-		i -= 4;
+		return 0;
 	}
 
-	return 0;
-}
+	const char* irxImportFuncname(const std::string& libname, u16 index)
+	{
+#include "IopModuleNames.cpp"
 
-const char* irxImportFuncname(const std::string &libname, u16 index)
-{
-	#include "IopModuleNames.cpp"
+		switch (index)
+		{
+			case 0:
+				return "start";
+			// case 1: reinit?
+			case 2:
+				return "shutdown";
+				// case 3: ???
+		}
 
-	switch (index) {
-		case 0: return "start";
-		// case 1: reinit?
-		case 2: return "shutdown";
-		// case 3: ???
+		return "";
 	}
 
-	return 0;
-}
+	// clang-format off
+#define MODULE(n)          \
+	if (#n == libname)     \
+	{                      \
+		using namespace n; \
+		switch (index)     \
+		{
+#define END_MODULE \
+	}              \
+	}
+#define EXPORT_D(i, n) \
+	case (i):          \
+		return n##_DEBUG;
+#define EXPORT_H(i, n) \
+	case (i):          \
+		return n##_HLE;
+	// clang-format on
 
-#define MODULE(n) if (#n == libname) { using namespace n; switch (index) {
-#define END_MODULE }}
-#define EXPORT_D(i, n) case (i): return n ## _DEBUG;
-#define EXPORT_H(i, n) case (i): return n ## _HLE;
+	irxHLE irxImportHLE(const std::string& libname, u16 index)
+	{
+		// debugging output
+		// clang-format off
+		MODULE(loadcore)
+			EXPORT_H(  6, RegisterLibraryEntries)
+			EXPORT_H(  7, ReleaseLibraryEntries);
+		END_MODULE
+		MODULE(sysmem)
+			EXPORT_H( 14, Kprintf)
+		END_MODULE
 
-irxHLE irxImportHLE(const std::string &libname, u16 index)
-{
-	// debugging output
-	MODULE(sysmem)
-		EXPORT_H( 14, Kprintf)
-	END_MODULE
+		// Special case with ioman and iomanX
+		// They are mostly compatible excluding stat structures
+		if(libname == "ioman" || libname == "iomanx")
+		{
+			const bool use_ioman = libname == "ioman";
+			using namespace ioman;
+				switch(index)
+				{
+					EXPORT_H(  4, open)
+					EXPORT_H(  5, close)
+					EXPORT_H(  6, read)
+					EXPORT_H(  7, write)
+					EXPORT_H(  8, lseek)
+					EXPORT_H( 10, remove)
+					EXPORT_H( 11, mkdir)
+					EXPORT_H( 12, rmdir)
+					EXPORT_H( 13, dopen)
+					EXPORT_H( 14, dclose)
+					case 15: // dread
+					if(use_ioman)
+						return dread_HLE;
+					else
+						return dreadx_HLE;
+					case 16: // getStat
+					if(use_ioman)
+						return getStat_HLE;
+					else
+						return getStatx_HLE;
+				}
+		}
+		// clang-format on
+		return 0;
+	}
 
-	MODULE(ioman)
-		EXPORT_H(  4, open)
-		EXPORT_H(  5, close)
-		EXPORT_H(  6, read)
-		EXPORT_H(  7, write)
-		EXPORT_H(  8, lseek)
-	END_MODULE
+	irxDEBUG irxImportDebug(const std::string& libname, u16 index)
+	{
+		// clang-format off
+		MODULE(intrman)
+			EXPORT_D(  4, RegisterIntrHandler)
+		END_MODULE
+		MODULE(sifcmd)
+			EXPORT_D( 17, sceSifRegisterRpc)
+		END_MODULE
+		// clang-format off
 
-	return 0;
-}
-
-irxDEBUG irxImportDebug(const std::string &libname, u16 index)
-{
-	MODULE(loadcore)
-		EXPORT_D(  6, RegisterLibraryEntries)
-	END_MODULE
-	MODULE(intrman)
-		EXPORT_D(  4, RegisterIntrHandler)
-	END_MODULE
-	MODULE(sifcmd)
-		EXPORT_D( 17, sceSifRegisterRpc)
-	END_MODULE
-
-	return 0;
-}
+		return 0;
+	}
 
 #undef MODULE
 #undef END_MODULE
 #undef EXPORT_D
 #undef EXPORT_H
 
-void irxImportLog(const std::string &libname, u16 index, const char *funcname)
+	void irxImportLog(const std::string& libname, u16 index, const char* funcname)
+	{
+		PSXBIOS_LOG("%8.8s.%03d: %s (%x, %x, %x, %x)",
+			libname.data(), index, funcname ? funcname : "unknown",
+			a0, a1, a2, a3);
+	}
+
+	void irxImportLog_rec(u32 import_table, u16 index, const char* funcname)
+	{
+		irxImportLog(iopMemReadString(import_table + 12, 8), index, funcname);
+	}
+
+	int irxImportExec(u32 import_table, u16 index)
+	{
+		if (!import_table)
+			return 0;
+
+		std::string libname = iopMemReadString(import_table + 12, 8);
+		const char* funcname = irxImportFuncname(libname, index);
+		irxHLE hle = irxImportHLE(libname, index);
+		irxDEBUG debug = irxImportDebug(libname, index);
+
+		irxImportLog(libname, index, funcname);
+
+		if (debug)
+			debug();
+
+		if (hle)
+			return hle();
+		else
+			return 0;
+	}
+
+} // end namespace R3000A
+
+bool SaveStateBase::handleFreeze()
 {
-	PSXBIOS_LOG("%8.8s.%03d: %s (%x, %x, %x, %x)",
-		libname.data(), index, funcname ? funcname : "unknown",
-		a0, a1, a2, a3);
+	if (!FreezeTag("hostHandles"))
+		return false;
+
+	if (EmuConfig.HostFs && IsLoading())
+		R3000A::ioman::reset();
+
+	const int firstfd = R3000A::ioman::firstfd;
+	size_t handleCount = EmuConfig.HostFs ? R3000A::handles.size() : 0;
+	Freeze(handleCount);
+
+	if (!EmuConfig.HostFs) //if hostfs isn't enabled, skip loading/saving file handles
+		return IsOkay();
+
+	for (size_t i = 0; i < handleCount; i++)
+	{
+		if (IsLoading())
+		{
+			//load the parameters for opening the file
+			s32 pos;
+			Freeze(pos);
+
+			R3000A::fileHandle handle;
+			Freeze(handle.flags);
+			FreezeString(handle.full_path);
+			Freeze(handle.mode);
+			R3000A::handles.push_back(handle);
+
+			//reopen the file
+			IOManFile* file = NULL;
+			R3000A::HostFile::open(&file, handle.full_path, handle.flags, handle.mode);
+			if (!file)
+			{
+				Console.Warning("Failed to open file: '%s'", handle.full_path.c_str());
+				continue;
+			}
+			R3000A::handles[i].fd_index = R3000A::ioman::allocfd(file) - firstfd;
+
+			//seek file to position when saved
+			file->lseek(pos, SEEK_SET);
+		}
+		else
+		{
+			//save the current file position
+			const u32 fd = R3000A::handles[i].fd_index;
+			IOManFile* file = R3000A::ioman::getfd<IOManFile>(fd + firstfd);
+			s32 pos = file ? file->lseek(0, SEEK_CUR) : 0;
+			Freeze(pos);
+
+			//save the parameters for opening the file
+			Freeze(R3000A::handles[i].flags);
+			FreezeString(R3000A::handles[i].full_path);
+			Freeze(R3000A::handles[i].mode);
+		}
+	}
+	return IsOkay();
 }
-
-void __fastcall irxImportLog_rec(u32 import_table, u16 index, const char *funcname)
-{
-	irxImportLog(iopMemReadString(import_table + 12, 8), index, funcname);
-}
-
-int irxImportExec(u32 import_table, u16 index)
-{
-	if (!import_table)
-		return 0;
-
-	std::string libname = iopMemReadString(import_table + 12, 8);
-	const char *funcname = irxImportFuncname(libname, index);
-	irxHLE hle = irxImportHLE(libname, index);
-	irxDEBUG debug = irxImportDebug(libname, index);
-
-	irxImportLog(libname, index, funcname);
-
-	if (debug)
-		debug();
-	
-	if (hle)
-		return hle();
-	else
-		return 0;
-}
-
-}	// end namespace R3000A

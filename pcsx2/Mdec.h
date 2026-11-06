@@ -1,24 +1,7 @@
-/*  Pcsx2 - Pc Ps2 Emulator
- *  Copyright (C) 2002-2008  Pcsx2 Team
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-2.0+
 
-#ifndef __MDEC_H__
-#define __MDEC_H__
-
+#pragma once
 
 // mdec status:
 #define MDEC_BUSY 0x20000000
@@ -100,5 +83,3 @@ void iqtab_init(int *iqtab,unsigned char *iq_y);
 void round_init(void);
 void yuv2rgb24(int *blk,unsigned char *image);
 void yuv2rgb15(int *blk,u16 *image);
-
-#endif /* __MDEC_H__ */

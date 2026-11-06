@@ -1,34 +1,14 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
-
-
-// recompiler reworked to add dynamic linking zerofrog(@gmail.com) Jan06
-
-#include "PrecompiledHeader.h"
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
 #include "Common.h"
 #include "R5900OpcodeTables.h"
-#include "iR5900.h"
+#include "x86/iR5900.h"
 
 using namespace x86Emitter;
 
-namespace R5900 {
-namespace Dynarec {
-namespace OpcodeImpl
+namespace R5900::Dynarec::OpcodeImpl
 {
-
 /*********************************************************
 * Register branch logic                                  *
 * Format:  OP rs, rt, offset                             *
@@ -56,332 +36,294 @@ REC_SYS_DEL(BGEZALL, 31);
 
 #else
 
-void recSetBranchEQ(int info, int bne, int process)
+static void recSetBranchEQ(int bne, int process)
 {
-	if( info & PROCESS_EE_XMM ) {
-		int t0reg;
+	// TODO(Stenzek): This is suboptimal if the registers are in XMMs.
+	// If the constant register is already in a host register, we don't need the immediate...
 
-		if( process & PROCESS_CONSTS ) {
-			if( (g_pCurInstInfo->regs[_Rt_] & EEINST_LASTUSE) || !EEINST_ISLIVEXMM(_Rt_) ) {
-				_deleteGPRtoXMMreg(_Rt_, 1);
-				xmmregs[EEREC_T].inuse = 0;
-				t0reg = EEREC_T;
-			}
-			else {
-				t0reg = _allocTempXMMreg(XMMT_INT, -1);
-				xMOVQZX(xRegisterSSE(t0reg), xRegisterSSE(EEREC_T));
-			}
+	if (process & PROCESS_CONSTS)
+	{
+		_eeFlushAllDirty();
 
-			_flushConstReg(_Rs_);
-			xPCMP.EQD(xRegisterSSE(t0reg), ptr[&cpuRegs.GPR.r[_Rs_].UL[0]]);
-
-
-			if( t0reg != EEREC_T ) _freeXMMreg(t0reg);
-		}
-		else if( process & PROCESS_CONSTT ) {
-			if( (g_pCurInstInfo->regs[_Rs_] & EEINST_LASTUSE) || !EEINST_ISLIVEXMM(_Rs_) ) {
-				_deleteGPRtoXMMreg(_Rs_, 1);
-				xmmregs[EEREC_S].inuse = 0;
-				t0reg = EEREC_S;
-			}
-			else {
-				t0reg = _allocTempXMMreg(XMMT_INT, -1);
-				xMOVQZX(xRegisterSSE(t0reg), xRegisterSSE(EEREC_S));
-			}
-
-			_flushConstReg(_Rt_);
-			xPCMP.EQD(xRegisterSSE(t0reg), ptr[&cpuRegs.GPR.r[_Rt_].UL[0]]);
-
-			if( t0reg != EEREC_S ) _freeXMMreg(t0reg);
-		}
-		else {
-
-			if( (g_pCurInstInfo->regs[_Rs_] & EEINST_LASTUSE) || !EEINST_ISLIVEXMM(_Rs_) ) {
-				_deleteGPRtoXMMreg(_Rs_, 1);
-				xmmregs[EEREC_S].inuse = 0;
-				t0reg = EEREC_S;
-				xPCMP.EQD(xRegisterSSE(t0reg), xRegisterSSE(EEREC_T));
-			}
-			else if( (g_pCurInstInfo->regs[_Rt_] & EEINST_LASTUSE) || !EEINST_ISLIVEXMM(_Rt_) ) {
-				_deleteGPRtoXMMreg(_Rt_, 1);
-				xmmregs[EEREC_T].inuse = 0;
-				t0reg = EEREC_T;
-				xPCMP.EQD(xRegisterSSE(t0reg), xRegisterSSE(EEREC_S));
-			}
-			else {
-				t0reg = _allocTempXMMreg(XMMT_INT, -1);
-				xMOVQZX(xRegisterSSE(t0reg), xRegisterSSE(EEREC_S));
-				xPCMP.EQD(xRegisterSSE(t0reg), xRegisterSSE(EEREC_T));
-			}
-
-			if( t0reg != EEREC_S && t0reg != EEREC_T ) _freeXMMreg(t0reg);
-		}
-
-		xMOVMSKPS(eax, xRegisterSSE(t0reg));
-
-		_eeFlushAllUnused();
-
-		xAND(al, 3);
-		xCMP(al, 0x3 );
-
-		if( bne ) j32Ptr[ 1 ] = JE32( 0 );
-		else j32Ptr[ 0 ] = j32Ptr[ 1 ] = JNE32( 0 );
+		_deleteGPRtoXMMreg(_Rt_, DELETE_REG_FLUSH_AND_FREE);
+		const int regt = _checkX86reg(X86TYPE_GPR, _Rt_, MODE_READ);
+		if (regt >= 0)
+			xImm64Op(xCMP, xRegister64(regt), rax, g_cpuConstRegs[_Rs_].UD[0]);
+		else
+			xImm64Op(xCMP, ptr64[&cpuRegs.GPR.r[_Rt_].UD[0]], rax, g_cpuConstRegs[_Rs_].UD[0]);
 	}
-	else {
+	else if (process & PROCESS_CONSTT)
+	{
+		_eeFlushAllDirty();
 
-		_eeFlushAllUnused();
+		_deleteGPRtoXMMreg(_Rs_, DELETE_REG_FLUSH_AND_FREE);
+		const int regs = _checkX86reg(X86TYPE_GPR, _Rs_, MODE_READ);
+		if (regs >= 0)
+			xImm64Op(xCMP, xRegister64(regs), rax, g_cpuConstRegs[_Rt_].UD[0]);
+		else
+			xImm64Op(xCMP, ptr64[&cpuRegs.GPR.r[_Rs_].UD[0]], rax, g_cpuConstRegs[_Rt_].UD[0]);
+	}
+	else
+	{
+		// force S into register, since we need to load it, may as well cache.
+		_deleteGPRtoXMMreg(_Rt_, DELETE_REG_FLUSH_AND_FREE);
+		const int regs = _allocX86reg(X86TYPE_GPR, _Rs_, MODE_READ);
+		const int regt = _checkX86reg(X86TYPE_GPR, _Rt_, MODE_READ);
+		_eeFlushAllDirty();
 
-		if( bne ) {
-			if( process & PROCESS_CONSTS ) {
-				xCMP(ptr32[&cpuRegs.GPR.r[ _Rt_ ].UL[ 0 ]], g_cpuConstRegs[_Rs_].UL[0] );
-				j8Ptr[ 0 ] = JNE8( 0 );
-
-				xCMP(ptr32[&cpuRegs.GPR.r[ _Rt_ ].UL[ 1 ]], g_cpuConstRegs[_Rs_].UL[1] );
-				j32Ptr[ 1 ] = JE32( 0 );
-			}
-			else if( process & PROCESS_CONSTT ) {
-				xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 0 ]], g_cpuConstRegs[_Rt_].UL[0] );
-				j8Ptr[ 0 ] = JNE8( 0 );
-
-				xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 1 ]], g_cpuConstRegs[_Rt_].UL[1] );
-				j32Ptr[ 1 ] = JE32( 0 );
-			}
-			else {
-				xMOV(eax, ptr[&cpuRegs.GPR.r[ _Rs_ ].UL[ 0 ] ]);
-				xCMP(eax, ptr[&cpuRegs.GPR.r[ _Rt_ ].UL[ 0 ] ]);
-				j8Ptr[ 0 ] = JNE8( 0 );
-
-				xMOV(eax, ptr[&cpuRegs.GPR.r[ _Rs_ ].UL[ 1 ] ]);
-				xCMP(eax, ptr[&cpuRegs.GPR.r[ _Rt_ ].UL[ 1 ] ]);
-				j32Ptr[ 1 ] = JE32( 0 );
-			}
-
-			x86SetJ8( j8Ptr[0] );
-		}
-		else {
-			// beq
-			if( process & PROCESS_CONSTS ) {
-				xCMP(ptr32[&cpuRegs.GPR.r[ _Rt_ ].UL[ 0 ]], g_cpuConstRegs[_Rs_].UL[0] );
-				j32Ptr[ 0 ] = JNE32( 0 );
-
-				xCMP(ptr32[&cpuRegs.GPR.r[ _Rt_ ].UL[ 1 ]], g_cpuConstRegs[_Rs_].UL[1] );
-				j32Ptr[ 1 ] = JNE32( 0 );
-			}
-			else if( process & PROCESS_CONSTT ) {
-				xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 0 ]], g_cpuConstRegs[_Rt_].UL[0] );
-				j32Ptr[ 0 ] = JNE32( 0 );
-
-				xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 1 ]], g_cpuConstRegs[_Rt_].UL[1] );
-				j32Ptr[ 1 ] = JNE32( 0 );
-			}
-			else {
-				xMOV(eax, ptr[&cpuRegs.GPR.r[ _Rs_ ].UL[ 0 ] ]);
-				xCMP(eax, ptr[&cpuRegs.GPR.r[ _Rt_ ].UL[ 0 ] ]);
-				j32Ptr[ 0 ] = JNE32( 0 );
-
-				xMOV(eax, ptr[&cpuRegs.GPR.r[ _Rs_ ].UL[ 1 ] ]);
-				xCMP(eax, ptr[&cpuRegs.GPR.r[ _Rt_ ].UL[ 1 ] ]);
-				j32Ptr[ 1 ] = JNE32( 0 );
-			}
-		}
+		if (regt >= 0)
+			xCMP(xRegister64(regs), xRegister64(regt));
+		else
+			xCMP(xRegister64(regs), ptr64[&cpuRegs.GPR.r[_Rt_]]);
 	}
 
-	_clearNeededXMMregs();
+	if (bne)
+		j32Ptr[0] = JE32(0);
+	else
+		j32Ptr[0] = JNE32(0);
 }
 
-void recSetBranchL(int ltz)
+static void recSetBranchL(int ltz)
 {
-	int regs = _checkXMMreg(XMMTYPE_GPRREG, _Rs_, MODE_READ);
+	const int regs = _checkX86reg(X86TYPE_GPR, _Rs_, MODE_READ);
+	const int regsxmm = _checkXMMreg(XMMTYPE_GPRREG, _Rs_, MODE_READ);
+	_eeFlushAllDirty();
 
-	if( regs >= 0 ) {
-		xMOVMSKPS(eax, xRegisterSSE(regs));
+	if (regsxmm >= 0)
+	{
+		xMOVMSKPS(eax, xRegisterSSE(regsxmm));
+		xTEST(al, 2);
 
-		_eeFlushAllUnused();
-
-		xTEST(al, 2 );
-
-		if( ltz ) j32Ptr[ 0 ] = JZ32( 0 );
-		else j32Ptr[ 0 ] = JNZ32( 0 );
+		if (ltz)
+			j32Ptr[0] = JZ32(0);
+		else
+			j32Ptr[0] = JNZ32(0);
 
 		return;
 	}
 
-	xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 1 ]], 0 );
-	if( ltz ) j32Ptr[ 0 ] = JGE32( 0 );
-	else j32Ptr[ 0 ] = JL32( 0 );
+	if (regs >= 0)
+		xCMP(xRegister64(regs), 0);
+	else
+		xCMP(ptr64[&cpuRegs.GPR.r[_Rs_].UD[0]], 0);
 
-	_clearNeededXMMregs();
+	if (ltz)
+		j32Ptr[0] = JGE32(0);
+	else
+		j32Ptr[0] = JL32(0);
 }
 
 //// BEQ
-void recBEQ_const()
+static void recBEQ_const()
 {
 	u32 branchTo;
 
-	if( g_cpuConstRegs[_Rs_].SD[0] == g_cpuConstRegs[_Rt_].SD[0] )
+	if (g_cpuConstRegs[_Rs_].SD[0] == g_cpuConstRegs[_Rt_].SD[0])
 		branchTo = ((s32)_Imm_ * 4) + pc;
 	else
-		branchTo = pc+4;
+		branchTo = pc + 4;
 
-	recompileNextInstruction(1);
-	SetBranchImm( branchTo );
+	recompileNextInstruction(true, false);
+	SetBranchImm(branchTo);
 }
 
-void recBEQ_process(int info, int process)
+static void recBEQ_process(int process)
 {
 	u32 branchTo = ((s32)_Imm_ * 4) + pc;
 
-	if ( _Rs_ == _Rt_ )
+	if (_Rs_ == _Rt_)
 	{
-		recompileNextInstruction(1);
-		SetBranchImm( branchTo );
+		recompileNextInstruction(true, false);
+		SetBranchImm(branchTo);
 	}
 	else
 	{
-		recSetBranchEQ(info, 0, process);
+		const bool swap = TrySwapDelaySlot(_Rs_, _Rt_, 0, true);
 
-		SaveBranchState();
-		recompileNextInstruction(1);
+		recSetBranchEQ(0, process);
+
+		if (!swap)
+		{
+			SaveBranchState();
+			recompileNextInstruction(true, false);
+		}
 
 		SetBranchImm(branchTo);
 
-		x86SetJ32( j32Ptr[ 0 ] );
-		x86SetJ32( j32Ptr[ 1 ] );
+		x86SetJ32(j32Ptr[0]);
 
-		// recopy the next inst
-		pc -= 4;
-		LoadBranchState();
-		recompileNextInstruction(1);
+		if (!swap)
+		{
+			// recopy the next inst
+			pc -= 4;
+			LoadBranchState();
+			recompileNextInstruction(true, false);
+		}
 
 		SetBranchImm(pc);
 	}
 }
 
-void recBEQ_(int info) { recBEQ_process(info, 0); }
-void recBEQ_consts(int info) { recBEQ_process(info, PROCESS_CONSTS); }
-void recBEQ_constt(int info) { recBEQ_process(info, PROCESS_CONSTT); }
-
-EERECOMPILE_CODE0(BEQ, XMMINFO_READS|XMMINFO_READT);
+void recBEQ()
+{
+	// prefer using the host register over an immediate, it'll be smaller code.
+	if (GPR_IS_CONST2(_Rs_, _Rt_))
+		recBEQ_const();
+	else if (GPR_IS_CONST1(_Rs_) && _checkX86reg(X86TYPE_GPR, _Rs_, MODE_READ) < 0)
+		recBEQ_process(PROCESS_CONSTS);
+	else if (GPR_IS_CONST1(_Rt_) && _checkX86reg(X86TYPE_GPR, _Rt_, MODE_READ) < 0)
+		recBEQ_process(PROCESS_CONSTT);
+	else
+		recBEQ_process(0);
+}
 
 //// BNE
-void recBNE_const()
+static void recBNE_const()
 {
 	u32 branchTo;
 
-	if( g_cpuConstRegs[_Rs_].SD[0] != g_cpuConstRegs[_Rt_].SD[0] )
+	if (g_cpuConstRegs[_Rs_].SD[0] != g_cpuConstRegs[_Rt_].SD[0])
 		branchTo = ((s32)_Imm_ * 4) + pc;
 	else
-		branchTo = pc+4;
+		branchTo = pc + 4;
 
-	recompileNextInstruction(1);
-	SetBranchImm( branchTo );
+	recompileNextInstruction(true, false);
+	SetBranchImm(branchTo);
 }
 
-void recBNE_process(int info, int process)
+static void recBNE_process(int process)
 {
 	u32 branchTo = ((s32)_Imm_ * 4) + pc;
 
-	if ( _Rs_ == _Rt_ )
+	if (_Rs_ == _Rt_)
 	{
-		recompileNextInstruction(1);
+		recompileNextInstruction(true, false);
 		SetBranchImm(pc);
 		return;
 	}
 
-	recSetBranchEQ(info, 1, process);
+	const bool swap = TrySwapDelaySlot(_Rs_, _Rt_, 0, true);
 
-	SaveBranchState();
-	recompileNextInstruction(1);
+	recSetBranchEQ(1, process);
+
+	if (!swap)
+	{
+		SaveBranchState();
+		recompileNextInstruction(true, false);
+	}
 
 	SetBranchImm(branchTo);
 
-	x86SetJ32( j32Ptr[ 1 ] );
+	x86SetJ32(j32Ptr[0]);
 
-	// recopy the next inst
-	pc -= 4;
-	LoadBranchState();
-	recompileNextInstruction(1);
+	if (!swap)
+	{
+		// recopy the next inst
+		pc -= 4;
+		LoadBranchState();
+		recompileNextInstruction(true, false);
+	}
 
 	SetBranchImm(pc);
 }
 
-void recBNE_(int info) { recBNE_process(info, 0); }
-void recBNE_consts(int info) { recBNE_process(info, PROCESS_CONSTS); }
-void recBNE_constt(int info) { recBNE_process(info, PROCESS_CONSTT); }
-
-EERECOMPILE_CODE0(BNE, XMMINFO_READS|XMMINFO_READT);
+void recBNE()
+{
+	if (GPR_IS_CONST2(_Rs_, _Rt_))
+		recBNE_const();
+	else if (GPR_IS_CONST1(_Rs_) && _checkX86reg(X86TYPE_GPR, _Rs_, MODE_READ) < 0)
+		recBNE_process(PROCESS_CONSTS);
+	else if (GPR_IS_CONST1(_Rt_) && _checkX86reg(X86TYPE_GPR, _Rt_, MODE_READ) < 0)
+		recBNE_process(PROCESS_CONSTT);
+	else
+		recBNE_process(0);
+}
 
 //// BEQL
-void recBEQL_const()
+static void recBEQL_const()
 {
-	if( g_cpuConstRegs[_Rs_].SD[0] == g_cpuConstRegs[_Rt_].SD[0] ) {
+	if (g_cpuConstRegs[_Rs_].SD[0] == g_cpuConstRegs[_Rt_].SD[0])
+	{
 		u32 branchTo = ((s32)_Imm_ * 4) + pc;
-		recompileNextInstruction(1);
-		SetBranchImm( branchTo );
+		recompileNextInstruction(true, false);
+		SetBranchImm(branchTo);
 	}
-	else {
-		SetBranchImm( pc+4 );
+	else
+	{
+		SetBranchImm(pc + 4);
 	}
 }
 
-void recBEQL_process(int info, int process)
+static void recBEQL_process(int process)
 {
 	u32 branchTo = ((s32)_Imm_ * 4) + pc;
-	recSetBranchEQ(info, 0, process);
+	recSetBranchEQ(0, process);
 
 	SaveBranchState();
-	recompileNextInstruction(1);
+	recompileNextInstruction(true, false);
 	SetBranchImm(branchTo);
 
-	x86SetJ32( j32Ptr[ 0 ] );
-	x86SetJ32( j32Ptr[ 1 ] );
+	x86SetJ32(j32Ptr[0]);
 
 	LoadBranchState();
 	SetBranchImm(pc);
 }
 
-void recBEQL_(int info) { recBEQL_process(info, 0); }
-void recBEQL_consts(int info) { recBEQL_process(info, PROCESS_CONSTS); }
-void recBEQL_constt(int info) { recBEQL_process(info, PROCESS_CONSTT); }
-
-EERECOMPILE_CODE0(BEQL, XMMINFO_READS|XMMINFO_READT);
+void recBEQL()
+{
+	if (GPR_IS_CONST2(_Rs_, _Rt_))
+		recBEQL_const();
+	else if (GPR_IS_CONST1(_Rs_) && _checkX86reg(X86TYPE_GPR, _Rs_, MODE_READ) < 0)
+		recBEQL_process(PROCESS_CONSTS);
+	else if (GPR_IS_CONST1(_Rt_) && _checkX86reg(X86TYPE_GPR, _Rt_, MODE_READ) < 0)
+		recBEQL_process(PROCESS_CONSTT);
+	else
+		recBEQL_process(0);
+}
 
 //// BNEL
-void recBNEL_const()
+static void recBNEL_const()
 {
-	if( g_cpuConstRegs[_Rs_].SD[0] != g_cpuConstRegs[_Rt_].SD[0] ) {
+	if (g_cpuConstRegs[_Rs_].SD[0] != g_cpuConstRegs[_Rt_].SD[0])
+	{
 		u32 branchTo = ((s32)_Imm_ * 4) + pc;
-		recompileNextInstruction(1);
+		recompileNextInstruction(true, false);
 		SetBranchImm(branchTo);
 	}
-	else {
-		SetBranchImm( pc+4 );
+	else
+	{
+		SetBranchImm(pc + 4);
 	}
 }
 
-void recBNEL_process(int info, int process)
+static void recBNEL_process(int process)
 {
 	u32 branchTo = ((s32)_Imm_ * 4) + pc;
 
-	recSetBranchEQ(info, 0, process);
+	recSetBranchEQ(0, process);
 
 	SaveBranchState();
-	SetBranchImm(pc+4);
+	SetBranchImm(pc + 4);
 
-	x86SetJ32( j32Ptr[ 0 ] );
-	x86SetJ32( j32Ptr[ 1 ] );
+	x86SetJ32(j32Ptr[0]);
 
 	// recopy the next inst
 	LoadBranchState();
-	recompileNextInstruction(1);
+	recompileNextInstruction(true, false);
 	SetBranchImm(branchTo);
 }
 
-void recBNEL_(int info) { recBNEL_process(info, 0); }
-void recBNEL_consts(int info) { recBNEL_process(info, PROCESS_CONSTS); }
-void recBNEL_constt(int info) { recBNEL_process(info, PROCESS_CONSTT); }
-
-EERECOMPILE_CODE0(BNEL, XMMINFO_READS|XMMINFO_READT);
+void recBNEL()
+{
+	if (GPR_IS_CONST2(_Rs_, _Rt_))
+		recBNEL_const();
+	else if (GPR_IS_CONST1(_Rs_) && _checkX86reg(X86TYPE_GPR, _Rs_, MODE_READ) < 0)
+		recBNEL_process(PROCESS_CONSTS);
+	else if (GPR_IS_CONST1(_Rt_) && _checkX86reg(X86TYPE_GPR, _Rt_, MODE_READ) < 0)
+		recBNEL_process(PROCESS_CONSTT);
+	else
+		recBNEL_process(0);
+}
 
 /*********************************************************
 * Register branch logic                                  *
@@ -408,35 +350,43 @@ void recBLTZAL()
 	u32 branchTo = ((s32)_Imm_ * 4) + pc;
 
 	_eeOnWriteReg(31, 0);
-	_eeFlushAllUnused();
+	_eeFlushAllDirty();
 
 	_deleteEEreg(31, 0);
-	xMOV(ptr32[&cpuRegs.GPR.r[31].UL[0]], pc+4);
-	xMOV(ptr32[&cpuRegs.GPR.r[31].UL[1]], 0);
+	xMOV64(rax, pc + 4);
+	xMOV(ptr64[&cpuRegs.GPR.n.ra.UD[0]], rax);
 
-	if( GPR_IS_CONST1(_Rs_) ) {
-		if( !(g_cpuConstRegs[_Rs_].SD[0] < 0) )
-			branchTo = pc+4;
+	if (GPR_IS_CONST1(_Rs_))
+	{
+		if (!(g_cpuConstRegs[_Rs_].SD[0] < 0))
+			branchTo = pc + 4;
 
-		recompileNextInstruction(1);
-		SetBranchImm( branchTo );
+		recompileNextInstruction(true, false);
+		SetBranchImm(branchTo);
 		return;
 	}
 
+	const bool swap = TrySwapDelaySlot(_Rs_, 0, 0, true);
+
 	recSetBranchL(1);
 
-	SaveBranchState();
-
-	recompileNextInstruction(1);
+	if (!swap)
+	{
+		SaveBranchState();
+		recompileNextInstruction(true, false);
+	}
 
 	SetBranchImm(branchTo);
 
-	x86SetJ32( j32Ptr[ 0 ] );
+	x86SetJ32(j32Ptr[0]);
 
-	// recopy the next inst
-	pc -= 4;
-	LoadBranchState();
-	recompileNextInstruction(1);
+	if (!swap)
+	{
+		// recopy the next inst
+		pc -= 4;
+		LoadBranchState();
+		recompileNextInstruction(true, false);
+	}
 
 	SetBranchImm(pc);
 }
@@ -449,35 +399,43 @@ void recBGEZAL()
 	u32 branchTo = ((s32)_Imm_ * 4) + pc;
 
 	_eeOnWriteReg(31, 0);
-	_eeFlushAllUnused();
+	_eeFlushAllDirty();
 
 	_deleteEEreg(31, 0);
-	xMOV(ptr32[&cpuRegs.GPR.r[31].UL[0]], pc+4);
-	xMOV(ptr32[&cpuRegs.GPR.r[31].UL[1]], 0);
+	xMOV64(rax, pc + 4);
+	xMOV(ptr64[&cpuRegs.GPR.n.ra.UD[0]], rax);
 
-	if( GPR_IS_CONST1(_Rs_) ) {
-		if( !(g_cpuConstRegs[_Rs_].SD[0] >= 0) )
-			branchTo = pc+4;
+	if (GPR_IS_CONST1(_Rs_))
+	{
+		if (!(g_cpuConstRegs[_Rs_].SD[0] >= 0))
+			branchTo = pc + 4;
 
-		recompileNextInstruction(1);
-		SetBranchImm( branchTo );
+		recompileNextInstruction(true, false);
+		SetBranchImm(branchTo);
 		return;
 	}
 
+	const bool swap = TrySwapDelaySlot(_Rs_, 0, 0, true);
+
 	recSetBranchL(0);
 
-	SaveBranchState();
-
-	recompileNextInstruction(1);
+	if (!swap)
+	{
+		SaveBranchState();
+		recompileNextInstruction(true, false);
+	}
 
 	SetBranchImm(branchTo);
 
-	x86SetJ32( j32Ptr[ 0 ] );
+	x86SetJ32(j32Ptr[0]);
 
-	// recopy the next inst
-	pc -= 4;
-	LoadBranchState();
-	recompileNextInstruction(1);
+	if (!swap)
+	{
+		// recopy the next inst
+		pc -= 4;
+		LoadBranchState();
+		recompileNextInstruction(true, false);
+	}
 
 	SetBranchImm(pc);
 }
@@ -490,18 +448,20 @@ void recBLTZALL()
 	u32 branchTo = ((s32)_Imm_ * 4) + pc;
 
 	_eeOnWriteReg(31, 0);
-	_eeFlushAllUnused();
+	_eeFlushAllDirty();
 
 	_deleteEEreg(31, 0);
-	xMOV(ptr32[&cpuRegs.GPR.r[31].UL[0]], pc+4);
-	xMOV(ptr32[&cpuRegs.GPR.r[31].UL[1]], 0);
+	xMOV64(rax, pc + 4);
+	xMOV(ptr64[&cpuRegs.GPR.n.ra.UD[0]], rax);
 
-	if( GPR_IS_CONST1(_Rs_) ) {
-		if( !(g_cpuConstRegs[_Rs_].SD[0] < 0) )
-			SetBranchImm( pc + 4);
-		else {
-			recompileNextInstruction(1);
-			SetBranchImm( branchTo );
+	if (GPR_IS_CONST1(_Rs_))
+	{
+		if (!(g_cpuConstRegs[_Rs_].SD[0] < 0))
+			SetBranchImm(pc + 4);
+		else
+		{
+			recompileNextInstruction(true, false);
+			SetBranchImm(branchTo);
 		}
 		return;
 	}
@@ -509,10 +469,10 @@ void recBLTZALL()
 	recSetBranchL(1);
 
 	SaveBranchState();
-	recompileNextInstruction(1);
+	recompileNextInstruction(true, false);
 	SetBranchImm(branchTo);
 
-	x86SetJ32( j32Ptr[ 0 ] );
+	x86SetJ32(j32Ptr[0]);
 
 	LoadBranchState();
 	SetBranchImm(pc);
@@ -526,18 +486,20 @@ void recBGEZALL()
 	u32 branchTo = ((s32)_Imm_ * 4) + pc;
 
 	_eeOnWriteReg(31, 0);
-	_eeFlushAllUnused();
+	_eeFlushAllDirty();
 
 	_deleteEEreg(31, 0);
-	xMOV(ptr32[&cpuRegs.GPR.r[31].UL[0]], pc+4);
-	xMOV(ptr32[&cpuRegs.GPR.r[31].UL[1]], 0);
+	xMOV64(rax, pc + 4);
+	xMOV(ptr64[&cpuRegs.GPR.n.ra.UD[0]], rax);
 
-	if( GPR_IS_CONST1(_Rs_) ) {
-		if( !(g_cpuConstRegs[_Rs_].SD[0] >= 0) )
-			SetBranchImm( pc + 4);
-		else {
-			recompileNextInstruction(1);
-			SetBranchImm( branchTo );
+	if (GPR_IS_CONST1(_Rs_))
+	{
+		if (!(g_cpuConstRegs[_Rs_].SD[0] >= 0))
+			SetBranchImm(pc + 4);
+		else
+		{
+			recompileNextInstruction(true, false);
+			SetBranchImm(branchTo);
 		}
 		return;
 	}
@@ -545,10 +507,10 @@ void recBGEZALL()
 	recSetBranchL(0);
 
 	SaveBranchState();
-	recompileNextInstruction(1);
+	recompileNextInstruction(true, false);
 	SetBranchImm(branchTo);
 
-	x86SetJ32( j32Ptr[ 0 ] );
+	x86SetJ32(j32Ptr[0]);
 
 	LoadBranchState();
 	SetBranchImm(pc);
@@ -562,42 +524,44 @@ void recBLEZ()
 
 	u32 branchTo = ((s32)_Imm_ * 4) + pc;
 
-	_eeFlushAllUnused();
+	if (GPR_IS_CONST1(_Rs_))
+	{
+		if (!(g_cpuConstRegs[_Rs_].SD[0] <= 0))
+			branchTo = pc + 4;
 
-	if( GPR_IS_CONST1(_Rs_) ) {
-		if( !(g_cpuConstRegs[_Rs_].SD[0] <= 0) )
-			branchTo = pc+4;
-
-		recompileNextInstruction(1);
-		SetBranchImm( branchTo );
+		recompileNextInstruction(true, false);
+		SetBranchImm(branchTo);
 		return;
 	}
 
-	_flushEEreg(_Rs_);
+	const bool swap = TrySwapDelaySlot(_Rs_, 0, 0, true);
+	const int regs = _checkX86reg(X86TYPE_GPR, _Rs_, MODE_READ);
+	_eeFlushAllDirty();
 
-	xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 1 ]], 0 );
-	j8Ptr[ 0 ] = JL8( 0 );
-	j32Ptr[ 1 ] = JG32( 0 );
+	if (regs >= 0)
+		xCMP(xRegister64(regs), 0);
+	else
+		xCMP(ptr64[&cpuRegs.GPR.r[_Rs_].UD[0]], 0);
 
-	xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 0 ]], 0 );
-	j32Ptr[ 2 ] = JNZ32( 0 );
+	j32Ptr[0] = JG32(0);
 
-	x86SetJ8( j8Ptr[ 0 ] );
-
-	_clearNeededXMMregs();
-
-	SaveBranchState();
-	recompileNextInstruction(1);
+	if (!swap)
+	{
+		SaveBranchState();
+		recompileNextInstruction(true, false);
+	}
 
 	SetBranchImm(branchTo);
 
-	x86SetJ32( j32Ptr[ 1 ] );
-	x86SetJ32( j32Ptr[ 2 ] );
+	x86SetJ32(j32Ptr[0]);
 
-	// recopy the next inst
-	pc -= 4;
-	LoadBranchState();
-	recompileNextInstruction(1);
+	if (!swap)
+	{
+		// recopy the next inst
+		pc -= 4;
+		LoadBranchState();
+		recompileNextInstruction(true, false);
+	}
 
 	SetBranchImm(pc);
 }
@@ -609,42 +573,44 @@ void recBGTZ()
 
 	u32 branchTo = ((s32)_Imm_ * 4) + pc;
 
-	_eeFlushAllUnused();
+	if (GPR_IS_CONST1(_Rs_))
+	{
+		if (!(g_cpuConstRegs[_Rs_].SD[0] > 0))
+			branchTo = pc + 4;
 
-	if( GPR_IS_CONST1(_Rs_) ) {
-		if( !(g_cpuConstRegs[_Rs_].SD[0] > 0) )
-			branchTo = pc+4;
-
-		recompileNextInstruction(1);
-		SetBranchImm( branchTo );
+		recompileNextInstruction(true, false);
+		SetBranchImm(branchTo);
 		return;
 	}
 
-	_flushEEreg(_Rs_);
+	const bool swap = TrySwapDelaySlot(_Rs_, 0, 0, true);
+	const int regs = _checkX86reg(X86TYPE_GPR, _Rs_, MODE_READ);
+	_eeFlushAllDirty();
 
-	xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 1 ]], 0 );
-	j8Ptr[ 0 ] = JG8( 0 );
-	j32Ptr[ 1 ] = JL32( 0 );
+	if (regs >= 0)
+		xCMP(xRegister64(regs), 0);
+	else
+		xCMP(ptr64[&cpuRegs.GPR.r[_Rs_].UD[0]], 0);
 
-	xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 0 ]], 0 );
-	j32Ptr[ 2 ] = JZ32( 0 );
+	j32Ptr[0] = JLE32(0);
 
-	x86SetJ8( j8Ptr[ 0 ] );
-
-	_clearNeededXMMregs();
-
-	SaveBranchState();
-	recompileNextInstruction(1);
+	if (!swap)
+	{
+		SaveBranchState();
+		recompileNextInstruction(true, false);
+	}
 
 	SetBranchImm(branchTo);
 
-	x86SetJ32( j32Ptr[ 1 ] );
-	x86SetJ32( j32Ptr[ 2 ] );
+	x86SetJ32(j32Ptr[0]);
 
-	// recopy the next inst
-	pc -= 4;
-	LoadBranchState();
-	recompileNextInstruction(1);
+	if (!swap)
+	{
+		// recopy the next inst
+		pc -= 4;
+		LoadBranchState();
+		recompileNextInstruction(true, false);
+	}
 
 	SetBranchImm(pc);
 }
@@ -656,30 +622,37 @@ void recBLTZ()
 
 	u32 branchTo = ((s32)_Imm_ * 4) + pc;
 
-	_eeFlushAllUnused();
+	if (GPR_IS_CONST1(_Rs_))
+	{
+		if (!(g_cpuConstRegs[_Rs_].SD[0] < 0))
+			branchTo = pc + 4;
 
-	if( GPR_IS_CONST1(_Rs_) ) {
-		if( !(g_cpuConstRegs[_Rs_].SD[0] < 0) )
-			branchTo = pc+4;
-
-		recompileNextInstruction(1);
-		SetBranchImm( branchTo );
+		recompileNextInstruction(true, false);
+		SetBranchImm(branchTo);
 		return;
 	}
 
+	const bool swap = TrySwapDelaySlot(_Rs_, 0, 0, true);
+	_eeFlushAllDirty();
 	recSetBranchL(1);
 
-	SaveBranchState();
-	recompileNextInstruction(1);
+	if (!swap)
+	{
+		SaveBranchState();
+		recompileNextInstruction(true, false);
+	}
 
 	SetBranchImm(branchTo);
 
-	x86SetJ32( j32Ptr[ 0 ] );
+	x86SetJ32(j32Ptr[0]);
 
-	// recopy the next inst
-	pc -= 4;
-	LoadBranchState();
-	recompileNextInstruction(1);
+	if (!swap)
+	{
+		// recopy the next inst
+		pc -= 4;
+		LoadBranchState();
+		recompileNextInstruction(true, false);
+	}
 
 	SetBranchImm(pc);
 }
@@ -691,30 +664,38 @@ void recBGEZ()
 
 	u32 branchTo = ((s32)_Imm_ * 4) + pc;
 
-	_eeFlushAllUnused();
+	if (GPR_IS_CONST1(_Rs_))
+	{
+		if (!(g_cpuConstRegs[_Rs_].SD[0] >= 0))
+			branchTo = pc + 4;
 
-	if( GPR_IS_CONST1(_Rs_) ) {
-		if( !(g_cpuConstRegs[_Rs_].SD[0] >= 0) )
-			branchTo = pc+4;
-
-		recompileNextInstruction(1);
-		SetBranchImm( branchTo );
+		recompileNextInstruction(true, false);
+		SetBranchImm(branchTo);
 		return;
 	}
 
+	const bool swap = TrySwapDelaySlot(_Rs_, 0, 0, true);
+	_eeFlushAllDirty();
+
 	recSetBranchL(0);
 
-	SaveBranchState();
-	recompileNextInstruction(1);
+	if (!swap)
+	{
+		SaveBranchState();
+		recompileNextInstruction(true, false);
+	}
 
 	SetBranchImm(branchTo);
 
-	x86SetJ32( j32Ptr[ 0 ] );
+	x86SetJ32(j32Ptr[0]);
 
-	// recopy the next inst
-	pc -= 4;
-	LoadBranchState();
-	recompileNextInstruction(1);
+	if (!swap)
+	{
+		// recopy the next inst
+		pc -= 4;
+		LoadBranchState();
+		recompileNextInstruction(true, false);
+	}
 
 	SetBranchImm(pc);
 }
@@ -724,27 +705,28 @@ void recBLTZL()
 {
 	EE::Profiler.EmitOp(eeOpcode::BLTZL);
 
-	u32 branchTo = ((s32)_Imm_ * 4) + pc;
+	const u32 branchTo = ((s32)_Imm_ * 4) + pc;
 
-	_eeFlushAllUnused();
-
-	if( GPR_IS_CONST1(_Rs_) ) {
-		if( !(g_cpuConstRegs[_Rs_].SD[0] < 0) )
-			SetBranchImm( pc + 4);
-		else {
-			recompileNextInstruction(1);
-			SetBranchImm( branchTo );
+	if (GPR_IS_CONST1(_Rs_))
+	{
+		if (!(g_cpuConstRegs[_Rs_].SD[0] < 0))
+			SetBranchImm(pc + 4);
+		else
+		{
+			recompileNextInstruction(true, false);
+			SetBranchImm(branchTo);
 		}
 		return;
 	}
 
+	_eeFlushAllDirty();
 	recSetBranchL(1);
 
 	SaveBranchState();
-	recompileNextInstruction(1);
+	recompileNextInstruction(true, false);
 	SetBranchImm(branchTo);
 
-	x86SetJ32( j32Ptr[ 0 ] );
+	x86SetJ32(j32Ptr[0]);
 
 	LoadBranchState();
 	SetBranchImm(pc);
@@ -756,32 +738,32 @@ void recBGEZL()
 {
 	EE::Profiler.EmitOp(eeOpcode::BGEZL);
 
-	u32 branchTo = ((s32)_Imm_ * 4) + pc;
+	const u32 branchTo = ((s32)_Imm_ * 4) + pc;
 
-	_eeFlushAllUnused();
-
-	if( GPR_IS_CONST1(_Rs_) ) {
-		if( !(g_cpuConstRegs[_Rs_].SD[0] >= 0) )
-			SetBranchImm( pc + 4);
-		else {
-			recompileNextInstruction(1);
-			SetBranchImm( branchTo );
+	if (GPR_IS_CONST1(_Rs_))
+	{
+		if (!(g_cpuConstRegs[_Rs_].SD[0] >= 0))
+			SetBranchImm(pc + 4);
+		else
+		{
+			recompileNextInstruction(true, false);
+			SetBranchImm(branchTo);
 		}
 		return;
 	}
 
+	_eeFlushAllDirty();
 	recSetBranchL(0);
 
 	SaveBranchState();
-	recompileNextInstruction(1);
+	recompileNextInstruction(true, false);
 	SetBranchImm(branchTo);
 
-	x86SetJ32( j32Ptr[ 0 ] );
+	x86SetJ32(j32Ptr[0]);
 
 	LoadBranchState();
 	SetBranchImm(pc);
 }
-
 
 
 
@@ -795,40 +777,35 @@ void recBLEZL()
 {
 	EE::Profiler.EmitOp(eeOpcode::BLEZL);
 
-	u32 branchTo = ((s32)_Imm_ * 4) + pc;
+	const u32 branchTo = ((s32)_Imm_ * 4) + pc;
 
-	_eeFlushAllUnused();
-
-	if( GPR_IS_CONST1(_Rs_) ) {
-		if( !(g_cpuConstRegs[_Rs_].SD[0] <= 0) )
-			SetBranchImm( pc + 4);
-		else {
-			_clearNeededXMMregs();
-			recompileNextInstruction(1);
-			SetBranchImm( branchTo );
+	if (GPR_IS_CONST1(_Rs_))
+	{
+		if (!(g_cpuConstRegs[_Rs_].SD[0] <= 0))
+			SetBranchImm(pc + 4);
+		else
+		{
+			recompileNextInstruction(true, false);
+			SetBranchImm(branchTo);
 		}
 		return;
 	}
 
-	_flushEEreg(_Rs_);
+	const int regs = _checkX86reg(X86TYPE_GPR, _Rs_, MODE_READ);
+	_eeFlushAllDirty();
 
-	xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 1 ]], 0 );
-	j32Ptr[ 0 ] = JL32( 0 );
-	j32Ptr[ 1 ] = JG32( 0 );
+	if (regs >= 0)
+		xCMP(xRegister64(regs), 0);
+	else
+		xCMP(ptr64[&cpuRegs.GPR.r[_Rs_].UD[0]], 0);
 
-	xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 0 ]], 0 );
-	j32Ptr[ 2 ] = JNZ32( 0 );
-
-	x86SetJ32( j32Ptr[ 0 ] );
-
-	_clearNeededXMMregs();
+	j32Ptr[0] = JG32(0);
 
 	SaveBranchState();
-	recompileNextInstruction(1);
+	recompileNextInstruction(true, false);
 	SetBranchImm(branchTo);
 
-	x86SetJ32( j32Ptr[ 1 ] );
-	x86SetJ32( j32Ptr[ 2 ] );
+	x86SetJ32(j32Ptr[0]);
 
 	LoadBranchState();
 	SetBranchImm(pc);
@@ -839,40 +816,36 @@ void recBGTZL()
 {
 	EE::Profiler.EmitOp(eeOpcode::BGTZL);
 
-	u32 branchTo = ((s32)_Imm_ * 4) + pc;
+	const u32 branchTo = ((s32)_Imm_ * 4) + pc;
 
-	_eeFlushAllUnused();
-
-	if( GPR_IS_CONST1(_Rs_) ) {
-		if( !(g_cpuConstRegs[_Rs_].SD[0] > 0) )
-			SetBranchImm( pc + 4);
-		else {
+	if (GPR_IS_CONST1(_Rs_))
+	{
+		if (!(g_cpuConstRegs[_Rs_].SD[0] > 0))
+			SetBranchImm(pc + 4);
+		else
+		{
 			_clearNeededXMMregs();
-			recompileNextInstruction(1);
-			SetBranchImm( branchTo );
+			recompileNextInstruction(true, false);
+			SetBranchImm(branchTo);
 		}
 		return;
 	}
 
-	_flushEEreg(_Rs_);
+	const int regs = _checkX86reg(X86TYPE_GPR, _Rs_, MODE_READ);
+	_eeFlushAllDirty();
 
-	xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 1 ]], 0 );
-	j32Ptr[ 0 ] = JG32( 0 );
-	j32Ptr[ 1 ] = JL32( 0 );
+	if (regs >= 0)
+		xCMP(xRegister64(regs), 0);
+	else
+		xCMP(ptr64[&cpuRegs.GPR.r[_Rs_].UD[0]], 0);
 
-	xCMP(ptr32[&cpuRegs.GPR.r[ _Rs_ ].UL[ 0 ]], 0 );
-	j32Ptr[ 2 ] = JZ32( 0 );
-
-	x86SetJ32( j32Ptr[ 0 ] );
-
-	_clearNeededXMMregs();
+	j32Ptr[0] = JLE32(0);
 
 	SaveBranchState();
-	recompileNextInstruction(1);
+	recompileNextInstruction(true, false);
 	SetBranchImm(branchTo);
 
-	x86SetJ32( j32Ptr[ 1 ] );
-	x86SetJ32( j32Ptr[ 2 ] );
+	x86SetJ32(j32Ptr[0]);
 
 	LoadBranchState();
 	SetBranchImm(pc);
@@ -880,4 +853,4 @@ void recBGTZL()
 
 #endif
 
-} } }
+} // namespace R5900::Dynarec::OpcodeImpl

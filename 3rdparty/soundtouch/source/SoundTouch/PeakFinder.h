@@ -1,19 +1,12 @@
 ////////////////////////////////////////////////////////////////////////////////
 ///
-/// The routine detects highest value on an array of values and calculates the 
+/// The routine detects highest value on an array of values and calculates the
 /// precise peak location as a mass-center of the 'hump' around the peak value.
 ///
 /// Author        : Copyright (c) Olli Parviainen
 /// Author e-mail : oparviai 'at' iki.fi
 /// SoundTouch WWW: http://www.surina.net/soundtouch
 ///
-////////////////////////////////////////////////////////////////////////////////
-//
-// Last changed  : $Date: 2011-12-30 22:33:46 +0200 (pe, 30 joulu 2011) $
-// File revision : $Revision: 4 $
-//
-// $Id: PeakFinder.h 132 2011-12-30 20:33:46Z oparviai $
-//
 ////////////////////////////////////////////////////////////////////////////////
 //
 // License :
@@ -51,8 +44,8 @@ protected:
 
     /// Calculates the mass center between given vector items.
     double calcMassCenter(const float *data, ///< Data vector.
-                         int firstPos,      ///< Index of first vector item beloging to the peak.
-                         int lastPos        ///< Index of last vector item beloging to the peak.
+                         int firstPos,      ///< Index of first vector item belonging to the peak.
+                         int lastPos        ///< Index of last vector item belonging to the peak.
                          ) const;
 
     /// Finds the data vector index where the monotoniously decreasing signal crosses the
@@ -67,7 +60,7 @@ protected:
     int findTop(const float *data, int peakpos) const;
 
 
-    /// Finds the 'ground' level, i.e. smallest level between two neighbouring peaks, to right- 
+    /// Finds the 'ground' level, i.e. smallest level between two neighbouring peaks, to right-
     /// or left-hand side of the given peak position.
     int   findGround(const float *data,     /// Data vector.
                      int peakpos,           /// Peak position index within the data vector.
@@ -78,7 +71,7 @@ protected:
     double getPeakCenter(const float *data, int peakpos) const;
 
 public:
-    /// Constructor. 
+    /// Constructor.
     PeakFinder();
 
     /// Detect exact peak position of the data vector by finding the largest peak 'hump'

@@ -1,32 +1,23 @@
-/*  PCSX2 - PS2 Emulator for PCs
-*  Copyright (C) 2002-2014  PCSX2 Dev Team
-*
-*  PCSX2 is free software: you can redistribute it and/or modify it under the terms
-*  of the GNU Lesser General Public License as published by the Free Software Found-
-*  ation, either version 3 of the License, or (at your option) any later version.
-*
-*  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
-*  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
-*  PURPOSE.  See the GNU General Public License for more details.
-*
-*  You should have received a copy of the GNU General Public License along with PCSX2.
-*  If not, see <http://www.gnu.org/licenses/>.
-*/
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
-#include "PrecompiledHeader.h"
-#include "AsyncFileReader.h"
-#include "CompressedFileReaderUtils.h"
-#include "CsoFileReader.h"
-#include "Pcsx2Types.h"
-#ifdef __POSIX__
+#include "CDVD/CsoFileReader.h"
+
+#include "common/Assertions.h"
+#include "common/Console.h"
+#include "common/FileSystem.h"
+#include "common/Error.h"
+#include "common/StringUtil.h"
+
+#include "fmt/format.h"
+#include "lz4.h"
+
 #include <zlib.h>
-#else
-#include <zlib/zlib.h>
-#endif
 
 // Implementation of CSO compressed ISO reading, based on:
 // https://github.com/unknownbrackets/maxcso/blob/master/README_CSO.md
-struct CsoHeader {
+struct CsoHeader
+{
 	u8 magic[4];
 	u32 header_size;
 	u64 total_bytes;
@@ -38,36 +29,34 @@ struct CsoHeader {
 
 static const u32 CSO_READ_BUFFER_SIZE = 256 * 1024;
 
-bool CsoFileReader::CanHandle(const wxString& fileName) {
-	bool supported = false;
-	if (wxFileName::FileExists(fileName) && fileName.Lower().EndsWith(L".cso")) {
-		FILE* fp = PX_fopen_rb(fileName);
-		CsoHeader hdr;
-		if (fp) {
-			if (fread(&hdr, 1, sizeof(hdr), fp) == sizeof(hdr)) {
-				supported = ValidateHeader(hdr);
-			}
-			fclose(fp);
-		}
-	}
-	return supported;
+CsoFileReader::CsoFileReader() = default;
+
+CsoFileReader::~CsoFileReader()
+{
+	pxAssert(!m_src);
 }
 
-bool CsoFileReader::ValidateHeader(const CsoHeader& hdr) {
-	if (hdr.magic[0] != 'C' || hdr.magic[1] != 'I' || hdr.magic[2] != 'S' || hdr.magic[3] != 'O') {
+bool CsoFileReader::ValidateHeader(const CsoHeader& hdr, Error* error)
+{
+	if ((hdr.magic[0] != 'C' && hdr.magic[0] != 'Z') || hdr.magic[1] != 'I' || hdr.magic[2] != 'S' || hdr.magic[3] != 'O')
+	{
 		// Invalid magic, definitely a bad file.
+		Error::SetString(error, "File is not a CSO or ZSO.");
 		return false;
 	}
-	if (hdr.ver > 1) {
-		Console.Error(L"Only CSOv1 files are supported.");
+	if (hdr.ver > 1)
+	{
+		Error::SetString(error, "Only CSOv1 files are supported.");
 		return false;
 	}
-	if ((hdr.frame_size & (hdr.frame_size - 1)) != 0) {
-		Console.Error(L"CSO frame size must be a power of two.");
+	if ((hdr.frame_size & (hdr.frame_size - 1)) != 0)
+	{
+		Error::SetString(error, "CSO frame size must be a power of two.");
 		return false;
 	}
-	if (hdr.frame_size < 2048) {
-		Console.Error(L"CSO frame size must be at least one sector.");
+	if (hdr.frame_size < 2048)
+	{
+		Error::SetString(error, "CSO frame size must be at least one sector.");
 		return false;
 	}
 
@@ -75,41 +64,69 @@ bool CsoFileReader::ValidateHeader(const CsoHeader& hdr) {
 	return true;
 }
 
-bool CsoFileReader::Open(const wxString& fileName) {
-	Close();
-	m_filename = fileName;
-	m_src = PX_fopen_rb(m_filename);
+bool CsoFileReader::Open2(std::string filename, Error* error)
+{
+	Close2();
+	m_filename = std::move(filename);
+	m_src = FileSystem::OpenCFile(m_filename.c_str(), "rb", error);
 
 	bool success = false;
-	if (m_src && ReadFileHeader() && InitializeBuffers()) {
+	if (m_src && ReadFileHeader(error) && InitializeBuffers(error))
+	{
 		success = true;
 	}
 
-	if (!success) {
-		Close();
+	if (!success)
+	{
+		Close2();
 		return false;
 	}
 	return true;
 }
 
-bool CsoFileReader::ReadFileHeader() {
-	CsoHeader hdr = {};
+bool CsoFileReader::Precache2(ProgressCallback* progress, Error* error)
+{
+	if (!m_src)
+		return false;
 
-	PX_fseeko(m_src, m_dataoffset, SEEK_SET);
-	if (fread(&hdr, 1, sizeof(hdr), m_src) != sizeof(hdr)) {
-		Console.Error(L"Failed to read CSO file header.");
+	const s64 size = FileSystem::FSize64(m_src);
+	if (size < 0 || !CheckAvailableMemoryForPrecaching(static_cast<u64>(size), error))
+		return false;
+
+	m_file_cache_size = static_cast<size_t>(size);
+	m_file_cache = std::make_unique_for_overwrite<u8[]>(m_file_cache_size);
+	if (FileSystem::FSeek64(m_src, 0, SEEK_SET) != 0 ||
+		FileSystem::ReadFileWithProgress(
+			m_src, m_file_cache.get(), m_file_cache_size, progress, error) != m_file_cache_size)
+	{
+		m_file_cache.reset();
 		return false;
 	}
 
-	if (!ValidateHeader(hdr)) {
-		Console.Error(L"CSO has invalid header.");
+	m_readBuffer.reset();
+	std::fclose(m_src);
+	m_src = nullptr;
+	return true;
+}
+
+bool CsoFileReader::ReadFileHeader(Error* error)
+{
+	CsoHeader hdr;
+
+	if (FileSystem::FSeek64(m_src, m_dataoffset, SEEK_SET) != 0 || std::fread(&hdr, 1, sizeof(hdr), m_src) != sizeof(hdr))
+	{
+		Error::SetString(error, "Failed to read CSO file header.");
 		return false;
 	}
+
+	if (!ValidateHeader(hdr, error))
+		return false;
 
 	m_frameSize = hdr.frame_size;
 	// Determine the translation from bytes to frame.
 	m_frameShift = 0;
-	for (u32 i = m_frameSize; i > 1; i >>= 1) {
+	for (u32 i = m_frameSize; i > 1; i >>= 1)
+	{
 		++m_frameShift;
 	}
 
@@ -117,127 +134,93 @@ bool CsoFileReader::ReadFileHeader() {
 	m_indexShift = hdr.align;
 	m_totalSize = hdr.total_bytes;
 
+	// Check compression method (ZSO=lz4)
+	m_uselz4 = hdr.magic[0] == 'Z';
+
 	return true;
 }
 
-bool CsoFileReader::InitializeBuffers() {
+bool CsoFileReader::InitializeBuffers(Error* error)
+{
 	// Round up, since part of a frame requires a full frame.
 	u32 numFrames = (u32)((m_totalSize + m_frameSize - 1) / m_frameSize);
 
 	// We might read a bit of alignment too, so be prepared.
-	if (m_frameSize + (1 << m_indexShift) < CSO_READ_BUFFER_SIZE) {
-		m_readBuffer = new u8[CSO_READ_BUFFER_SIZE];
-	} else {
-		m_readBuffer = new u8[m_frameSize + (1 << m_indexShift)];
+	if (m_frameSize + (1 << m_indexShift) < CSO_READ_BUFFER_SIZE)
+	{
+		m_readBuffer = std::make_unique<u8[]>(CSO_READ_BUFFER_SIZE);
 	}
-
-	// This is a buffer for the most recently decompressed frame.
-	m_zlibBuffer = new u8[m_frameSize + (1 << m_indexShift)];
-	m_zlibBufferFrame = numFrames;
+	else
+	{
+		m_readBuffer = std::make_unique<u8[]>(m_frameSize + (1 << m_indexShift));
+	}
 
 	const u32 indexSize = numFrames + 1;
-	m_index = new u32[indexSize];
-	if (fread(m_index, sizeof(u32), indexSize, m_src) != indexSize) {
-		Console.Error(L"Unable to read index data from CSO.");
+	m_index = std::make_unique<u32[]>(indexSize);
+	if (fread(m_index.get(), sizeof(u32), indexSize, m_src) != indexSize)
+	{
+		Error::SetString(error, "Unable to read index data from CSO.");
 		return false;
 	}
 
-	m_z_stream = new z_stream;
-	m_z_stream->zalloc = Z_NULL;
-	m_z_stream->zfree = Z_NULL;
-	m_z_stream->opaque = Z_NULL;
-	if (inflateInit2(m_z_stream, -15) != Z_OK) {
-		Console.Error("Unable to initialize zlib for CSO decompression.");
-		return false;
+	// initialize zlib if not a ZSO
+	if (!m_uselz4)
+	{
+		if (inflateInit2(&m_z_stream, -15) != Z_OK)
+		{
+			Error::SetString(error, "Unable to initialize zlib for CSO decompression.");
+			return false;
+		}
 	}
 
 	return true;
 }
 
-void CsoFileReader::Close() {
-	m_filename.Empty();
-#if CSO_USE_CHUNKSCACHE
-	m_cache.Clear();
-#endif
+void CsoFileReader::Close2()
+{
+	m_filename.clear();
 
-	if (m_src) {
+	if (m_src)
+	{
 		fclose(m_src);
-		m_src = NULL;
+		m_src = nullptr;
 	}
-	if (m_z_stream) {
-		inflateEnd(m_z_stream);
-		m_z_stream = NULL;
-	}
+	if (m_file_cache)
+		m_file_cache.reset();
+	if (!m_uselz4)
+		inflateEnd(&m_z_stream);
 
-	if (m_readBuffer) {
-		delete[] m_readBuffer;
-		m_readBuffer = NULL;
-	}
-	if (m_zlibBuffer) {
-		delete[] m_zlibBuffer;
-		m_zlibBuffer = NULL;
-	}
-	if (m_index) {
-		delete[] m_index;
-		m_index = NULL;
-	}
+	m_readBuffer.reset();
+	m_index.reset();
 }
 
-int CsoFileReader::ReadSync(void* pBuffer, uint sector, uint count) {
-	if (!m_src) {
-		return 0;
-	}
-
-	// Note that, in practice, count will always be 1.  It seems one sector is read
-	// per interrupt, even if multiple are requested by the application.
-
-	u8* dest = (u8*)pBuffer;
-	// We do it this way in case m_blocksize is not well aligned to our frame size.
-	u64 pos = (u64)sector * (u64)m_blocksize;
-	int remaining = count * m_blocksize;
-	int bytes = 0;
-
-	while (remaining > 0) {
-		int readBytes;
-
-#if CSO_USE_CHUNKSCACHE
-		// Try first to read from the cache.
-		readBytes = m_cache.Read(dest + bytes, pos + bytes, remaining);
-#else
-		readBytes = -1;
-#endif
-		if (readBytes < 0) {
-			readBytes = ReadFromFrame(dest + bytes, pos + bytes, remaining);
-			if (readBytes == 0) {
-				// We hit EOF.
-				break;
-			}
-
-#if CSO_USE_CHUNKSCACHE
-			// Add the bytes into the cache.  We need to allocate a buffer for it.
-			void *cached = malloc(readBytes);
-			memcpy(cached, dest + bytes, readBytes);
-			m_cache.Take(cached, pos + bytes, readBytes, readBytes);
-#endif
-		}
-
-		bytes += readBytes;
-		remaining -= readBytes;
-	}
-
-	return bytes;
+u32 CsoFileReader::GetBlockCount() const
+{
+	return static_cast<u32>((m_totalSize - m_dataoffset) / m_blocksize);
 }
 
-int CsoFileReader::ReadFromFrame(u8 *dest, u64 pos, int maxBytes) {
-	if (pos >= m_totalSize) {
-		// Can't read anything passed the end.
-		return 0;
+ThreadedFileReader::Chunk CsoFileReader::ChunkForOffset(u64 offset)
+{
+	Chunk chunk = {0};
+	if (offset >= m_totalSize)
+	{
+		chunk.chunkID = -1;
 	}
+	else
+	{
+		chunk.chunkID = offset >> m_frameShift;
+		chunk.length = m_frameSize;
+		chunk.offset = chunk.chunkID << m_frameShift;
+	}
+	return chunk;
+}
 
-	const u32 frame = (u32)(pos >> m_frameShift);
-	const u32 offset = (u32)(pos - (frame << m_frameShift));
-	// This is how many bytes we will actually be reading from this frame.
-	const u32 bytes = (u32)(std::min(m_blocksize, static_cast<uint>(m_frameSize - offset)));
+int CsoFileReader::ReadChunk(void* dst, s64 chunkID)
+{
+	if (chunkID < 0)
+		return -1;
+
+	const u32 frame = chunkID;
 
 	// Grab the index data for the frame we're about to read.
 	const bool compressed = (m_index[frame + 0] & 0x80000000) == 0;
@@ -248,66 +231,80 @@ int CsoFileReader::ReadFromFrame(u8 *dest, u64 pos, int maxBytes) {
 	const u64 frameRawPos = (u64)index0 << m_indexShift;
 	const u64 frameRawSize = (u64)(index1 - index0) << m_indexShift;
 
-	if (!compressed) {
+	if (!compressed)
+	{
+		if (m_file_cache)
+		{
+			if (frameRawPos >= m_file_cache_size)
+				return 0;
+
+			const size_t read_count = std::min<size_t>(m_file_cache_size - frameRawPos, frameRawSize);
+			std::memcpy(dst, &m_file_cache[frameRawPos], read_count);
+			return static_cast<int>(read_count);
+		}
+
 		// Just read directly, easy.
-		if (PX_fseeko(m_src, m_dataoffset + frameRawPos + offset, SEEK_SET) != 0) {
+		if (FileSystem::FSeek64(m_src, frameRawPos, SEEK_SET) != 0)
+		{
 			Console.Error("Unable to seek to uncompressed CSO data.");
 			return 0;
 		}
-		return fread(dest, 1, bytes, m_src);
-	} else {
-		// We don't need to decompress if we already did this same frame last time.
-		if (m_zlibBufferFrame != frame) {
-			if (PX_fseeko(m_src, m_dataoffset + frameRawPos, SEEK_SET) != 0) {
+		return fread(dst, 1, m_frameSize, m_src);
+	}
+	else
+	{
+		// This might be less bytes than frameRawSize in case of padding on the last frame.
+		// This is because the index positions must be aligned.
+		u32 readRawBytes;
+		u8* readBuffer;
+		if (m_file_cache)
+		{
+			if (frameRawPos >= m_file_cache_size)
+				return 0;
+
+			readRawBytes = static_cast<u32>(std::min<size_t>(m_file_cache_size - frameRawPos, frameRawSize));
+			readBuffer = &m_file_cache[frameRawPos];
+		}
+		else
+		{
+			if (FileSystem::FSeek64(m_src, frameRawPos, SEEK_SET) != 0)
+			{
 				Console.Error("Unable to seek to compressed CSO data.");
 				return 0;
 			}
-			// This might be less bytes than frameRawSize in case of padding on the last frame.
-			// This is because the index positions must be aligned.
-			const u32 readRawBytes = fread(m_readBuffer, 1, frameRawSize, m_src);
-			if (!DecompressFrame(frame, readRawBytes)) {
-				return 0;
-			}
+			readBuffer = m_readBuffer.get();
+			readRawBytes = fread(m_readBuffer.get(), 1, frameRawSize, m_src);
 		}
 
-		// Now we just copy the offset data from the cache.
-		memcpy(dest, m_zlibBuffer + offset, bytes);
+		bool success = false;
+
+		if (m_uselz4)
+		{
+			const int src_size = static_cast<int>(readRawBytes);
+			const int dst_size = static_cast<int>(m_frameSize);
+			const char* src_buf = reinterpret_cast<const char*>(readBuffer);
+			char* dst_buf = static_cast<char*>(dst);
+			
+			const int res = LZ4_decompress_safe_partial(src_buf, dst_buf, src_size, dst_size, dst_size);
+			success = (res > 0);
+		}
+		else
+		{
+			m_z_stream.next_in = readBuffer;
+			m_z_stream.avail_in = readRawBytes;
+			m_z_stream.next_out = static_cast<Bytef*>(dst);
+			m_z_stream.avail_out = m_frameSize;
+
+			const int status = inflate(&m_z_stream, Z_FINISH);
+			success = (status == Z_STREAM_END && m_z_stream.total_out == m_frameSize);
+		}
+
+		if (!success)
+			Console.Error(fmt::format("Unable to decompress CSO frame using {}", (m_uselz4)? "lz4":"zlib"));
+		
+		if (!m_uselz4)
+			inflateReset(&m_z_stream);
+
+		return success ? m_frameSize : 0;
 	}
-
-	return bytes;
-}
-
-bool CsoFileReader::DecompressFrame(u32 frame, u32 readBufferSize) {
-	m_z_stream->next_in = m_readBuffer;
-	m_z_stream->avail_in = readBufferSize;
-	m_z_stream->next_out = m_zlibBuffer;
-	m_z_stream->avail_out = m_frameSize;
-
-	int status = inflate(m_z_stream, Z_FINISH);
-	bool success = status == Z_STREAM_END && m_z_stream->total_out == m_frameSize;
-	if (success) {
-		// Our buffer now contains this frame.
-		m_zlibBufferFrame = frame;
-	} else {
-		Console.Error("Unable to decompress CSO frame using zlib.");
-		m_zlibBufferFrame = (u32)-1;
-	}
-
-	inflateReset(m_z_stream);
-	return success;
-}
-
-void CsoFileReader::BeginRead(void* pBuffer, uint sector, uint count) {
-	// TODO: No async support yet, implement as sync.
-	m_bytesRead = ReadSync(pBuffer, sector, count);
-}
-
-int CsoFileReader::FinishRead() {
-	int res = m_bytesRead;
-	m_bytesRead = -1;
-	return res;
-}
-
-void CsoFileReader::CancelRead() {
-	// TODO: No async read support yet.
 }

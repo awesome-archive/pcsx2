@@ -1,6 +1,6 @@
 ////////////////////////////////////////////////////////////////////////////////
-/// 
-/// Sample rate transposer. Changes sample rate by using linear interpolation 
+///
+/// Sample rate transposer. Changes sample rate by using linear interpolation
 /// together with anti-alias filtering (first order interpolation with anti-
 /// alias filtering should be quite adequate for this application)
 ///
@@ -8,13 +8,6 @@
 /// Author e-mail : oparviai 'at' iki.fi
 /// SoundTouch WWW: http://www.surina.net/soundtouch
 ///
-////////////////////////////////////////////////////////////////////////////////
-//
-// Last changed  : $Date: 2016-10-15 22:34:59 +0300 (la, 15 loka 2016) $
-// File revision : $Revision: 4 $
-//
-// $Id: RateTransposer.cpp 243 2016-10-15 19:34:59Z oparviai $
-//
 ////////////////////////////////////////////////////////////////////////////////
 //
 // License :
@@ -57,13 +50,19 @@ TransposerBase::ALGORITHM TransposerBase::algorithm = TransposerBase::CUBIC;
 // Constructor
 RateTransposer::RateTransposer() : FIFOProcessor(&outputBuffer)
 {
-    bUseAAFilter = true;
+    bUseAAFilter =
+#ifndef SOUNDTOUCH_PREVENT_CLICK_AT_RATE_CROSSOVER
+        true;
+#else
+        // Disable Anti-alias filter if desirable to avoid click at rate change zero value crossover
+        false;
+#endif
 
     // Instantiates the anti-alias filter
     pAAFilter = new AAFilter(64);
     pTransposer = TransposerBase::newInstance();
+    clear();
 }
-
 
 
 RateTransposer::~RateTransposer()
@@ -73,11 +72,14 @@ RateTransposer::~RateTransposer()
 }
 
 
-
 /// Enables/disables the anti-alias filter. Zero to disable, nonzero to enable
 void RateTransposer::enableAAFilter(bool newMode)
 {
+#ifndef SOUNDTOUCH_PREVENT_CLICK_AT_RATE_CROSSOVER
+    // Disable Anti-alias filter if desirable to avoid click at rate change zero value crossover
     bUseAAFilter = newMode;
+    clear();
+#endif
 }
 
 
@@ -94,8 +96,7 @@ AAFilter *RateTransposer::getAAFilter()
 }
 
 
-
-// Sets new target iRate. Normal iRate = 1.0, smaller values represent slower 
+// Sets new target iRate. Normal iRate = 1.0, smaller values represent slower
 // iRate, larger faster iRates.
 void RateTransposer::setRate(double newRate)
 {
@@ -104,11 +105,11 @@ void RateTransposer::setRate(double newRate)
     pTransposer->setRate(newRate);
 
     // design a new anti-alias filter
-    if (newRate > 1.0) 
+    if (newRate > 1.0)
     {
         fCutoff = 0.5 / newRate;
-    } 
-    else 
+    }
+    else
     {
         fCutoff = 0.5 * newRate;
     }
@@ -124,14 +125,12 @@ void RateTransposer::putSamples(const SAMPLETYPE *samples, uint nSamples)
 }
 
 
-// Transposes sample rate by applying anti-alias filter to prevent folding. 
+// Transposes sample rate by applying anti-alias filter to prevent folding.
 // Returns amount of samples returned in the "dest" buffer.
 // The maximum amount of samples that can be returned at a time is set by
 // the 'set_returnBuffer_size' function.
 void RateTransposer::processSamples(const SAMPLETYPE *src, uint nSamples)
 {
-    uint count;
-
     if (nSamples == 0) return;
 
     // Store samples to input buffer
@@ -139,16 +138,16 @@ void RateTransposer::processSamples(const SAMPLETYPE *src, uint nSamples)
 
     // If anti-alias filter is turned off, simply transpose without applying
     // the filter
-    if (bUseAAFilter == false) 
+    if (bUseAAFilter == false)
     {
-        count = pTransposer->transpose(outputBuffer, inputBuffer);
+        (void)pTransposer->transpose(outputBuffer, inputBuffer);
         return;
     }
 
     assert(pAAFilter);
 
     // Transpose with anti-alias filter
-    if (pTransposer->rate < 1.0f) 
+    if (pTransposer->rate < 1.0f)
     {
         // If the parameter 'Rate' value is smaller than 1, first transpose
         // the samples and then apply the anti-alias filter to remove aliasing.
@@ -158,8 +157,8 @@ void RateTransposer::processSamples(const SAMPLETYPE *src, uint nSamples)
 
         // Apply the anti-alias filter for transposed samples in midBuffer
         pAAFilter->evaluate(outputBuffer, midBuffer);
-    } 
-    else  
+    }
+    else
     {
         // If the parameter 'Rate' value is larger than 1, first apply the
         // anti-alias filter to remove high frequencies (prevent them from folding
@@ -177,11 +176,10 @@ void RateTransposer::processSamples(const SAMPLETYPE *src, uint nSamples)
 // Sets the number of channels, 1 = mono, 2 = stereo
 void RateTransposer::setChannels(int nChannels)
 {
-    assert(nChannels > 0);
+    if (!verifyNumberOfChannels(nChannels) ||
+        (pTransposer->numChannels == nChannels)) return;
 
-    if (pTransposer->numChannels == nChannels) return;
     pTransposer->setChannels(nChannels);
-
     inputBuffer.setChannels(nChannels);
     midBuffer.setChannels(nChannels);
     outputBuffer.setChannels(nChannels);
@@ -194,6 +192,11 @@ void RateTransposer::clear()
     outputBuffer.clear();
     midBuffer.clear();
     inputBuffer.clear();
+    pTransposer->resetRegisters();
+
+    // prefill buffer to avoid losing first samples at beginning of stream
+    int prefill = getLatency();
+    inputBuffer.addSilent(prefill);
 }
 
 
@@ -211,14 +214,15 @@ int RateTransposer::isEmpty() const
 /// Return approximate initial input-output latency
 int RateTransposer::getLatency() const
 {
-    return (bUseAAFilter) ? pAAFilter->getLength() : 0;
+    return pTransposer->getLatency() +
+        ((bUseAAFilter) ? (pAAFilter->getLength() / 2) : 0);
 }
 
 
 //////////////////////////////////////////////////////////////////////////////
 //
 // TransposerBase - Base class for interpolation
-// 
+//
 
 // static function to set interpolation algorithm
 void TransposerBase::setAlgorithm(TransposerBase::ALGORITHM a)
@@ -227,7 +231,7 @@ void TransposerBase::setAlgorithm(TransposerBase::ALGORITHM a)
 }
 
 
-// Transposes the sample rate of the given samples using linear interpolation. 
+// Transposes the sample rate of the given samples using linear interpolation.
 // Returns the number of samples returned in the "dest" buffer
 int TransposerBase::transpose(FIFOSampleBuffer &dest, FIFOSampleBuffer &src)
 {
@@ -242,11 +246,11 @@ int TransposerBase::transpose(FIFOSampleBuffer &dest, FIFOSampleBuffer &src)
     {
         numOutput = transposeMono(pdest, psrc, numSrcSamples);
     }
-    else if (numChannels == 2) 
+    else if (numChannels == 2)
     {
         numOutput = transposeStereo(pdest, psrc, numSrcSamples);
-    } 
-    else 
+    }
+    else
 #endif // USE_MULTICH_ALWAYS
     {
         assert(numChannels > 0);
@@ -287,7 +291,7 @@ void TransposerBase::setRate(double newRate)
 TransposerBase *TransposerBase::newInstance()
 {
 #ifdef SOUNDTOUCH_INTEGER_SAMPLES
-    // Notice: For integer arithmetics support only linear algorithm (due to simplest calculus)
+    // Notice: For integer arithmetic support only linear algorithm (due to simplest calculus)
     return ::new InterpolateLinearInteger;
 #else
     switch (algorithm)
@@ -303,7 +307,7 @@ TransposerBase *TransposerBase::newInstance()
 
         default:
             assert(false);
-            return NULL;
+            return nullptr;
     }
 #endif
 }

@@ -1,27 +1,26 @@
-/*  PCSX2 - PS2 Emulator for PCs
- *  Copyright (C) 2002-2010  PCSX2 Dev Team
- *
- *  PCSX2 is free software: you can redistribute it and/or modify it under the terms
- *  of the GNU Lesser General Public License as published by the Free Software Found-
- *  ation, either version 3 of the License, or (at your option) any later version.
- *
- *  PCSX2 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
- *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
- *  PURPOSE.  See the GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along with PCSX2.
- *  If not, see <http://www.gnu.org/licenses/>.
- */
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
 
-
-#include "PrecompiledHeader.h"
 #include "IopHw_Internal.h"
 #include "Sif.h"
-#include "Sio.h"
-#include "CDVD/CdRom.h"
+#include "SIO/Sio2.h"
+#include "SIO/Sio0.h"
+#include "CDVD/Ps1CD.h"
+#include "FW.h"
+#include "SPU2/spu2.h"
+#include "DEV9/DEV9.h"
+#include "USB/USB.h"
+#include "IopCounters.h"
+#include "IopDma.h"
 
 #include "ps2/pgif.h"
 #include "Mdec.h"
+
+#define SIO0LOG_ENABLE 0
+#define SIO2LOG_ENABLE 0
+
+#define Sio0Log if (SIO0LOG_ENABLE) DevCon
+#define Sio2Log if (SIO2LOG_ENABLE) DevCon
 
 namespace IopMemory
 {
@@ -29,22 +28,31 @@ using namespace Internal;
 
 //////////////////////////////////////////////////////////////////////////////////////////
 //
-mem8_t __fastcall iopHwRead8_Page1( u32 addr )
+mem8_t iopHwRead8_Page1( u32 addr )
 {
 	// all addresses are assumed to be prefixed with 0x1f801xxx:
 	pxAssume( (addr >> 12) == 0x1f801 );
 
-	u32 masked_addr = addr & 0x0fff;
+	const u32 masked_addr = addr & 0x0fff;
 
-	mem8_t ret;		// using a return var can be helpful in debugging.
+	mem8_t ret = 0; // using a return var can be helpful in debugging.
 	switch( masked_addr )
 	{
-		mcase(HW_SIO_DATA) :
-			// 1F801040h 1/4  JOY_DATA Joypad/Memory Card Data (R/W)
-			// psxmode: documentation suggests a valid 8 bit read and the rest of the 32 bit register is unclear.
-			// todo: check this and compare with the HW_SIO_DATA read around line 245 as well.
-			ret = sioRead8();
-		break;
+		case (HW_SIO_DATA & 0x0fff):
+			ret = g_Sio0.GetRxData();
+			break;
+		case (HW_SIO_STAT & 0x0fff):
+			Sio0Log.Error("%s(%08X) Unexpected SIO0 STAT 8 bit read", __FUNCTION__, addr);
+			break;
+		case (HW_SIO_MODE & 0x0fff):
+			Sio0Log.Error("%s(%08X) Unexpected SIO0 MODE 8 bit read", __FUNCTION__, addr);
+			break;
+		case (HW_SIO_CTRL & 0x0fff):
+			Sio0Log.Error("%s(%08X) Unexpected SIO0 CTRL 8 bit read", __FUNCTION__, addr);
+			break;
+		case (HW_SIO_BAUD & 0x0fff):
+			Sio0Log.Error("%s(%08X) Unexpected SIO0 BAUD 8 bit read", __FUNCTION__, addr);
+			break;
 
 		// for use of serial port ignore for now
 		//case 0x50: ret = serial_read8(); break;
@@ -62,12 +70,12 @@ mem8_t __fastcall iopHwRead8_Page1( u32 addr )
 				DevCon.Warning( "HwRead8 from Counter16 [ignored] @ 0x%08x = 0x%02x", addr, psxHu8(addr) );
 				ret = psxHu8( addr );
 			}
-			else if( masked_addr >= 0x480 && masked_addr < 0x4a0 )
+			else if ( masked_addr >= 0x480 && masked_addr < 0x4a0 )
 			{
 				DevCon.Warning( "HwRead8 from Counter32 [ignored] @ 0x%08x = 0x%02x", addr, psxHu8(addr) );
 				ret = psxHu8( addr );
 			}
-			else if( (masked_addr >= pgmsk(HW_USB_START)) && (masked_addr < pgmsk(HW_USB_END)) )
+			else if ( (masked_addr >= pgmsk(HW_USB_START)) && (masked_addr < pgmsk(HW_USB_END)) )
 			{
 				ret = USBread8( addr );
 				PSXHW_LOG( "HwRead8 from USB @ 0x%08x = 0x%02x", addr, ret );
@@ -86,35 +94,48 @@ mem8_t __fastcall iopHwRead8_Page1( u32 addr )
 
 //////////////////////////////////////////////////////////////////////////////////////////
 //
-mem8_t __fastcall iopHwRead8_Page3( u32 addr )
+mem8_t iopHwRead8_Page3(u32 addr)
 {
 	// all addresses are assumed to be prefixed with 0x1f803xxx:
-	pxAssume( (addr >> 12) == 0x1f803 );
+	pxAssume((addr >> 12) == 0x1f803);
+
+	const u32 masked_addr = addr & 0x0fff;
 
 	mem8_t ret;
-	if( addr == 0x1f803100 )	// PS/EE/IOP conf related
-		//ret = 0x10; // Dram 2M
-		ret = 0xFF; //all high bus is the corect default state for CEX PS2!
-	else
-		ret = psxHu8( addr );
+	switch (masked_addr)
+	{
+		case 0x100: // TOOL config switches
+			ret = 0;
+			break;
+		case 0x204: // TOOL board id
+			ret = 0x7c;
+			break;
+		default:
+			ret = psxHu8(addr);
+			break;
+	}
 
-	IopHwTraceLog<mem8_t>( addr, ret, true );
+	IopHwTraceLog<mem8_t>(addr, ret, true);
 	return ret;
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////
 //
-mem8_t __fastcall iopHwRead8_Page8( u32 addr )
+mem8_t iopHwRead8_Page8( u32 addr )
 {
 	// all addresses are assumed to be prefixed with 0x1f808xxx:
 	pxAssume( (addr >> 12) == 0x1f808 );
 
 	mem8_t ret;
 
-	if( addr == HW_SIO2_FIFO )
-		ret = sio2_fifoOut();//sio2 serial data feed/fifo_out
+	if (addr == HW_SIO2_RX)
+	{
+		ret = g_Sio2.Read();
+	}
 	else
-		ret = psxHu8( addr );
+	{
+		ret = psxHu8(addr);
+	}
 
 	IopHwTraceLog<mem8_t>( addr, ret, true );
 	return ret;
@@ -149,19 +170,15 @@ static __fi T _HwRead_16or32_Page1( u32 addr )
 			break;
 
 			case 0x4:
-				ret = psxCounters[cntidx].mode;
+				ret = psxCounters[cntidx].mode.modeval;
 
-				// hmm!  The old code only did this bitwise math for 16 bit reads.
-				// Logic indicates it should do the math consistently.  Question is,
-				// should it do the logic for both 16 and 32, or not do logic at all?
-
-				psxCounters[cntidx].mode &= ~0x1800;
+				psxRcntSetNewIntrMode(cntidx);
 			break;
 
 			case 0x8:
 				ret = psxCounters[cntidx].target;
 			break;
-			
+
 			default:
 				DevCon.Warning("Unknown 16bit counter read %x", addr);
 				ret = psxHu32(addr);
@@ -171,7 +188,7 @@ static __fi T _HwRead_16or32_Page1( u32 addr )
 	// ------------------------------------------------------------------------
 	// Counters, 32-bit varieties!
 	//
-	else if( masked_addr >= 0x480 && masked_addr < 0x4b0 )
+	else if ( masked_addr >= 0x480 && masked_addr < 0x4b0 )
 	{
 		int cntidx = (( masked_addr >> 4 ) & 0xf) - 5;
 		switch( masked_addr & 0xf )
@@ -185,21 +202,20 @@ static __fi T _HwRead_16or32_Page1( u32 addr )
 			break;
 
 			case 0x4:
-				ret = psxCounters[cntidx].mode;
+				ret = psxCounters[cntidx].mode.modeval;
+				PSXCNT_LOG("IOP Counter[%d] modeRead%d = %lx", cntidx, sizeof(T) * 8, ret);
 
-				// hmm!  The old code only did the following bitwise math for 16 bit reads.
-				// Logic indicates it should do the math consistently.  Question is,
-				// should it do the logic for both 16 and 32, or not do logic at all?
-
-				psxCounters[cntidx].mode &= ~0x1800;
+				psxRcntSetNewIntrMode(cntidx);
 			break;
 
 			case 0x8:
 				ret = psxCounters[cntidx].target;
+				PSXCNT_LOG("IOP Counter[%d] targetRead%d = %lx", cntidx, sizeof(T), ret);
 			break;
 
 			case 0xa:
 				ret = psxCounters[cntidx].target >> 16;
+				PSXCNT_LOG("IOP Counter[%d] targetUpperRead%d = %lx", cntidx, sizeof(T), ret);
 			break;
 
 			default:
@@ -211,14 +227,14 @@ static __fi T _HwRead_16or32_Page1( u32 addr )
 	// ------------------------------------------------------------------------
 	// USB, with both 16 and 32 bit interfaces
 	//
-	else if( (masked_addr >= pgmsk(HW_USB_START)) && (masked_addr < pgmsk(HW_USB_END)) )
+	else if ( (masked_addr >= pgmsk(HW_USB_START)) && (masked_addr < pgmsk(HW_USB_END)) )
 	{
 		ret = (sizeof(T) == 2) ? USBread16( addr ) : USBread32( addr );
 	}
 	// ------------------------------------------------------------------------
 	// SPU2, accessible in 16 bit mode only!
 	//
-	else if( masked_addr >= pgmsk(HW_SPU2_START) && masked_addr < pgmsk(HW_SPU2_END) )
+	else if ( masked_addr >= pgmsk(HW_SPU2_START) && masked_addr < pgmsk(HW_SPU2_END) )
 	{
 		if( sizeof(T) == 2 )
 			ret = SPU2read( addr );
@@ -231,7 +247,7 @@ static __fi T _HwRead_16or32_Page1( u32 addr )
 	// ------------------------------------------------------------------------
 	// PS1 GPU access
 	//
-	else if( (masked_addr >= pgmsk(HW_PS1_GPU_START)) && (masked_addr < pgmsk(HW_PS1_GPU_END)) )
+	else if ( (masked_addr >= pgmsk(HW_PS1_GPU_START)) && (masked_addr < pgmsk(HW_PS1_GPU_END)) )
 	{
 		// todo: psx mode: this is new
 		if( sizeof(T) == 2 )
@@ -246,38 +262,34 @@ static __fi T _HwRead_16or32_Page1( u32 addr )
 		switch( masked_addr )
 		{
 			// ------------------------------------------------------------------------
-			mcase(HW_SIO_DATA):
-				ret  = sioRead8();
-				ret |= sioRead8() << 8;
-				if( sizeof(T) == 4 )
+			case (HW_SIO_DATA & 0x0fff):
+				Console.Warning("%s(%08X) Unexpected 16 or 32 bit access to SIO0 data register!", __FUNCTION__, addr);
+				ret = g_Sio0.GetRxData();
+				ret |= g_Sio0.GetRxData() << 8;
+				if (sizeof(T) == 4)
 				{
-					ret |= sioRead8() << 16;
-					ret |= sioRead8() << 24;
+					ret |= g_Sio0.GetRxData() << 16;
+					ret |= g_Sio0.GetRxData() << 24;
 				}
-			break;
-
-			mcase(HW_SIO_STAT):
-				ret = sio.StatReg;
-				sioStatRead();
-				// Console.WriteLn( "SIO0 Read STAT %02X INT_STAT= %08X IOPpc= %08X " , ret, psxHu32(0x1070), psxRegs.pc);
-			break;
-
-			mcase(HW_SIO_MODE):
-				ret = sio.ModeReg;
-				if( sizeof(T) == 4 )
+				break;
+			case (HW_SIO_STAT & 0x0fff):
+				ret = g_Sio0.GetStat();
+				break;
+			case (HW_SIO_MODE & 0x0fff):
+				ret = g_Sio0.GetMode();
+				
+				if (sizeof(T) == 4)
 				{
-					// My guess on 32-bit accesses.  Dunno yet what the real hardware does. --air
-					ret |= sio.CtrlReg << 16;
+					Console.Warning("%s(%08X) Unexpected 32 bit access to SIO0 MODE register!", __FUNCTION__, addr);
 				}
-			break;
-
-			mcase(HW_SIO_CTRL):
-				ret = sio.CtrlReg;
-			break;
-
-			mcase(HW_SIO_BAUD):
-				ret = sio.BaudReg;
-			break;
+				
+				break;
+			case (HW_SIO_CTRL & 0x0fff):
+				ret = g_Sio0.GetCtrl();
+				break;
+			case (HW_SIO_BAUD & 0x0fff):
+				ret = g_Sio0.GetBaud();
+				break;
 
 			// ------------------------------------------------------------------------
 			//Serial port stuff not support now ;P
@@ -287,24 +299,13 @@ static __fi T _HwRead_16or32_Page1( u32 addr )
 			//	case 0x05e: hard = serial_baud_read(); break;
 
 			mcase(HW_ICTRL):
-				ret = psxHu32(0x1078);
-				psxHu32(0x1078) = 0;
+				ret = psxHu32(HW_ICTRL);
+				psxHu32(HW_ICTRL) = 0;
 			break;
 
 			mcase(HW_ICTRL+2):
-				ret = psxHu16(0x107a);
-				psxHu32(0x1078) = 0;	// most likely should clear all 32 bits here.
-			break;
-
-			// ------------------------------------------------------------------------
-			// Soon-to-be outdated SPU2 DMA hack (spu2 manages its own DMA MADR).
-			//
-			mcase(0x1f8010C0):
-				ret = SPU2ReadMemAddr(0);
-			break;
-
-			mcase(0x1f801500):
-				ret = SPU2ReadMemAddr(1);
+				ret = psxHu16(HW_ICTRL+2);
+				psxHu32(HW_ICTRL) = 0;	// most likely should clear all 32 bits here.
 			break;
 
 			// ------------------------------------------------------------------------
@@ -317,14 +318,12 @@ static __fi T _HwRead_16or32_Page1( u32 addr )
 
 			mcase(HW_PS1_GPU_DATA) :
 				ret = psxGPUr(addr);
-				//ret = psxHu32(addr); // old
-				DevCon.Warning("GPU Data Read %x", ret);
 			break;
-			
+
 			mcase(HW_PS1_GPU_STATUS) :
 				ret = psxGPUr(addr);
 			break;
-			
+
 			mcase (0x1f801820): // MDEC
 				// ret = psxHu32(addr); // old
 				ret = mdecRead0();
@@ -332,7 +331,7 @@ static __fi T _HwRead_16or32_Page1( u32 addr )
 				DevCon.Warning("MDEC 1820 Read %x", ret);
 #endif
 			break;
-			
+
 			mcase (0x1f801824): // MDEC
 				//ret = psxHu32(addr); // old
 				ret = mdecRead1();
@@ -363,14 +362,14 @@ static __fi T _HwRead_16or32_Page1( u32 addr )
 
 //////////////////////////////////////////////////////////////////////////////////////////
 //
-mem16_t __fastcall iopHwRead16_Page1( u32 addr )
+mem16_t iopHwRead16_Page1( u32 addr )
 {
 	return _HwRead_16or32_Page1<mem16_t>( addr );
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////
 //
-mem16_t __fastcall iopHwRead16_Page3( u32 addr )
+mem16_t iopHwRead16_Page3( u32 addr )
 {
 	// all addresses are assumed to be prefixed with 0x1f803xxx:
 	pxAssume( (addr >> 12) == 0x1f803 );
@@ -382,7 +381,7 @@ mem16_t __fastcall iopHwRead16_Page3( u32 addr )
 
 //////////////////////////////////////////////////////////////////////////////////////////
 //
-mem16_t __fastcall iopHwRead16_Page8( u32 addr )
+mem16_t iopHwRead16_Page8( u32 addr )
 {
 	// all addresses are assumed to be prefixed with 0x1f808xxx:
 	pxAssume( (addr >> 12) == 0x1f808 );
@@ -394,14 +393,14 @@ mem16_t __fastcall iopHwRead16_Page8( u32 addr )
 
 //////////////////////////////////////////////////////////////////////////////////////////
 //
-mem32_t __fastcall iopHwRead32_Page1( u32 addr )
+mem32_t iopHwRead32_Page1( u32 addr )
 {
 	return _HwRead_16or32_Page1<mem32_t>( addr );
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////
 //
-mem32_t __fastcall iopHwRead32_Page3( u32 addr )
+mem32_t iopHwRead32_Page3( u32 addr )
 {
 	// all addresses are assumed to be prefixed with 0x1f803xxx:
 	pxAssume( (addr >> 12) == 0x1f803 );
@@ -412,7 +411,7 @@ mem32_t __fastcall iopHwRead32_Page3( u32 addr )
 
 //////////////////////////////////////////////////////////////////////////////////////////
 //
-mem32_t __fastcall iopHwRead32_Page8( u32 addr )
+mem32_t iopHwRead32_Page8( u32 addr )
 {
 	// all addresses are assumed to be prefixed with 0x1f808xxx:
 	pxAssume( (addr >> 12) == 0x1f808 );
@@ -425,48 +424,63 @@ mem32_t __fastcall iopHwRead32_Page8( u32 addr )
 		if( masked_addr < 0x240 )
 		{
 			const int parm = (masked_addr-0x200) / 4;
-			ret = sio2_getSend3( parm );
+			ret = g_Sio2.CmdQueue[parm];
+			Sio2Log.WriteLn("%s(%08X) SIO2 SEND3 Read (%08X)", __FUNCTION__, addr, ret);
 		}
-		else if( masked_addr < 0x260 )
+		else if ( masked_addr < 0x260 )
 		{
 			// SIO2 Send commands alternate registers.  First reg maps to Send1, second
 			// to Send2, third to Send1, etc.  And the following clever code does this:
-
 			const int parm = (masked_addr-0x240) / 8;
-			ret = (masked_addr & 4) ? sio2_getSend2( parm ) : sio2_getSend1( parm );
+			ret = (masked_addr & 4) ? g_Sio2.PortCtrl1[parm] : g_Sio2.PortCtrl0[parm];
+			Sio2Log.WriteLn("%s(%08X) SIO2 SEND1/2 Read (%08X)", __FUNCTION__, addr, ret);
 		}
-		else if( masked_addr <= 0x280 )
+		else if ( masked_addr <= 0x280 )
 		{
 			switch( masked_addr )
 			{
-				mcase(HW_SIO2_CTRL):	ret = sio2_getCtrl();	break;
-				mcase(HW_SIO2_RECV1):	ret = sio2_getRecv1();	break;
-				mcase(HW_SIO2_RECV2):	ret = sio2_getRecv2();	break;
-				mcase(HW_SIO2_RECV3):	ret = sio2_getRecv3();	break;
-				mcase(0x1f808278):		ret = sio2_get8278();	break;
-				mcase(0x1f80827C):		ret = sio2_get827C();	break;
-				mcase(HW_SIO2_INTR):	ret = sio2_getIntr();	break;
-
-				// HW_SIO2_FIFO -- A yet unknown: Should this be ignored on 32 bit writes, or handled as a
-				// 4-byte FIFO input?
-				// The old IOP system just ignored it, so that's what we do here.  I've included commented code
-				// for treating it as a 16/32 bit write though [which is what the SIO does, for example).
-				mcase(HW_SIO2_FIFO) :
-					//ret = sio2_fifoOut();
-					//ret |= sio2_fifoOut() << 8;
-					//ret |= sio2_fifoOut() << 16;
-					//ret |= sio2_fifoOut() << 24;
-				//break;
-					DevCon.Warning("HW_SIO2_FIFO read");
+				case (HW_SIO2_TX & 0x0fff):
 					ret = psxHu32(addr);
-				break;
-
+					Sio2Log.Warning("%s(%08X) Unexpected 32 bit read of HW_SIO2_DATAIN (%08X)", __FUNCTION__, addr, ret);
+					break;
+				case (HW_SIO2_RX & 0x0fff):
+					ret = psxHu32(addr);
+					Sio2Log.Warning("%s(%08X) Unexpected 32 bit read of HW_SIO2_FIFO (%08X)", __FUNCTION__, addr, ret);
+					break;
+				case (HW_SIO2_CTRL & 0x0fff):
+					ret = g_Sio2.ctrl;
+					Sio2Log.WriteLn("%s(%08X) SIO2 CTRL Read (%08X)", __FUNCTION__, addr, ret);
+					break;
+				case (HW_SIO2_CMD_STAT & 0xfff):
+					ret = g_Sio2.CmdStat;
+					Sio2Log.WriteLn("%s(%08X) SIO2 RECV1 Read (%08X)", __FUNCTION__, addr, ret);
+					break;
+				case (HW_SIO2_PORT_STAT & 0x0fff):
+					ret = g_Sio2.PortStat;
+					Sio2Log.WriteLn("%s(%08X) SIO2 RECV2 Read (%08X)", __FUNCTION__, addr, ret);
+					break;
+				case (HW_SIO2_FIFO_STAT & 0x0fff):
+					ret = g_Sio2.FifoStat;
+					Sio2Log.WriteLn("%s(%08X) SIO2 RECV3 Read (%08X)", __FUNCTION__, addr, ret);
+					break;
+				case (0x1f808278 & 0x0fff):
+					ret = g_Sio2.FifoTxPos;
+					Sio2Log.WriteLn("%s(%08X) SIO2 UNK1 Read (%08X)", __FUNCTION__, addr, ret);
+					break;
+				case (0x1f80827C & 0x0fff):
+					ret = g_Sio2.FifoRxPos;
+					Sio2Log.WriteLn("%s(%08X) SIO2 UNK2 Read (%08X)", __FUNCTION__, addr, ret);
+					break;
+				case (HW_SIO2_INTR & 0x0fff):
+					ret = g_Sio2.iStat;
+					Sio2Log.WriteLn("%s(%08X) SIO2 ISTAT Read (%08X)", __FUNCTION__, addr, ret);
+					break;
 				default:
 					ret = psxHu32(addr);
-				break;
+					break;
 			}
 		}
-		else if( masked_addr >= pgmsk(HW_FW_START) && masked_addr <= pgmsk(HW_FW_END) )
+		else if ( masked_addr >= pgmsk(HW_FW_START) && masked_addr <= pgmsk(HW_FW_END) )
 		{
 			ret = FWread32( addr );
 		} else {
